@@ -7,7 +7,6 @@ use gtk4::{
 };
 use midir::{Ignore, MidiInput, MidiInputConnection, MidiOutput, MidiOutputConnection};
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
@@ -254,12 +253,12 @@ fn prompt(notes: &[Note], bpm: f64) -> String {
         .collect();
     notes.sort_by_key(|note| (note.onset_ms, note.pitch));
     let step_ms = 60_000.0 / bpm / 24.0;
-    let mut previous = 0;
+    let mut previous = None;
     notes
         .into_iter()
         .map(|note| {
-            let delta = note.onset_ms.saturating_sub(previous);
-            previous = note.onset_ms;
+            let delta = previous.map_or(0, |onset| note.onset_ms.saturating_sub(onset));
+            previous = Some(note.onset_ms);
             format!(
                 "{},{},{},{}",
                 note.pitch,
@@ -534,6 +533,6 @@ mod tests {
             velocity: 80,
             generated: false,
         }];
-        assert_eq!(prompt(&notes, 120.0), "60,24,12,80");
+        assert_eq!(prompt(&notes, 120.0), "60,0,12,80");
     }
 }

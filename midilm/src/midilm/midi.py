@@ -56,10 +56,10 @@ def read_midi(path: Path) -> list[list[int]]:
         finish(key, tick)
     notes.sort(key=lambda note: (note[0], note[1]))
 
-    previous_onset = 0
+    previous_onset = None
     encoded = []
     for onset, pitch, duration, velocity in notes:
-        delta_ticks = onset - previous_onset
+        delta_ticks = 0 if previous_onset is None else onset - previous_onset
         delta_steps = round(delta_ticks * 24 / midi.ticks_per_beat)
         duration_steps = round(duration * 24 / midi.ticks_per_beat)
         encoded.append(encode_note(pitch, delta_steps, duration_steps, velocity))

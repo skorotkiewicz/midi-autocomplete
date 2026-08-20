@@ -28,9 +28,9 @@ class ModelConfig:
     @classmethod
     def preset(cls, name: str) -> "ModelConfig":
         return {
-            "small": cls(512, 8, 8, 1536),
-            "medium": cls(640, 12, 10, 1728),
-            "large": cls(768, 16, 12, 2048),
+            "small": cls(512, 8, 8, 1792),
+            "medium": cls(640, 12, 10, 1856),
+            "large": cls(768, 16, 12, 2304),
             "tiny": cls(128, 2, 4, 256, 64),
         }[name]
 
