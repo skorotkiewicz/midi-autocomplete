@@ -1365,4 +1365,84 @@ mod tests {
         }];
         assert_eq!(prompt(&notes, 120.0), "60,0,12,80");
     }
+
+    // Hardware-in-the-loop integration tests. Run with `cargo test -- --ignored`.
+    // These need the actual RockJam board connected (per config.toml) and only
+    // touch it in read-only ways that don't leave stuck notes: enumerate ports,
+    // open an output connection, and render a real SoundFont to valid samples.
+    mod hardware {
+        use super::*;
+
+        fn config() -> AppConfig {
+            load_config(&config_path()).expect("config.toml should exist")
+        }
+
+        fn board_name(role: &str) -> Option<String> {
+            let config = config();
+            let name = if role == "input" {
+                config.midi_input
+            } else {
+                config.midi_output
+            };
+            name.filter(|name| !name.trim().is_empty())
+        }
+
+        #[test]
+        #[ignore]
+        fn input_port_matches_config() {
+            let name = board_name("input").expect("midi_input set in config");
+            let present = midi_inputs().iter().any(|candidate| candidate == &name);
+            assert!(present, "input device '{name}' should appear in midi_inputs()");
+        }
+
+        #[test]
+        #[ignore]
+        fn output_port_matches_config() {
+            let name = board_name("output").expect("midi_output set in config");
+            let present = midi_outputs().iter().any(|candidate| candidate == &name);
+            assert!(present, "output device '{name}' should appear in midi_outputs()");
+        }
+
+        #[test]
+        #[ignore]
+        fn output_port_opens_connection() {
+            let name = board_name("output").expect("midi_output set in config");
+            let names = midi_outputs();
+            let index = names
+                .iter()
+                .position(|candidate| candidate == &name)
+                .expect("output device present");
+            let connection = connect_output(index as u32)
+                .expect("should open a connection to the RockJam output");
+            drop(connection); // no notes sent; just verify the port is connectable
+        }
+
+        #[test]
+        #[ignore]
+        fn soundfont_renders_note_to_samples() {
+            let path = PathBuf::from(
+                config()
+                    .soundfont
+                    .expect("soundfont set in config"),
+            );
+            assert!(
+                path.exists(),
+                "SoundFont file should exist: {}",
+                path.display()
+            );
+            let events = vec![
+                (0, true, 60, 100),
+                (500, false, 60, 0),
+            ];
+            let samples = render_soundfont(&path, &events)
+                .expect("should render the SoundFont without error");
+            // ~500ms at 48kHz stereo = ~48k samples; real note should be audible (non-silent)
+            assert!(samples.len() > 40_000, "samples should cover the note duration");
+            let energy = samples
+                .iter()
+                .map(|sample| sample.abs())
+                .fold(0.0_f64, |acc, sample| acc + sample as f64);
+            assert!(energy > 0.0, "a real note should produce nonzero audio energy");
+        }
+    }
 }
