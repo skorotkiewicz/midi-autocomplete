@@ -67,7 +67,15 @@ uv run --extra gpu midilm train /path/to/midi \
   --output checkpoints/small.pt
 ```
 
-The presets are approximately the article's 33M, 64M, and 125M classes. Training sums cross-entropy over all five output heads, applies transposition, tempo, duration, velocity, and dropped-note augmentation, and ramps scheduled sampling to 50%. Corpus selection, cleaning, deduplication, and train/validation splitting remain the caller's job because the original dataset is not public.
+The presets are approximately the article's 33M, 64M, and 125M classes. Training sums cross-entropy over all five output heads, applies transposition, tempo, duration, velocity, and dropped-note augmentation, ramps scheduled sampling to 50%, warms up the learning rate linearly, then decays it with a cosine schedule to the end of training. A held-out fraction of MIDI files yields a validation loss each epoch, and the best model is written to `{output}.best.pt`. Corpus selection, cleaning, deduplication, and train/validation splitting remain the caller's job because the original dataset is not public.
+
+Tune the schedule and validation split explicitly:
+
+```sh
+uv run --extra gpu midilm train /path/to/midi \
+  --warmup-fraction 0.05 \
+  --val-fraction 0.05
+```
 
 After each epoch, training writes a lean GUI checkpoint such as `medium.pt` and a `medium.resume.pt` sidecar containing optimizer and progress state. Resume with the same data and training settings:
 

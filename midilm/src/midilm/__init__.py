@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import random
 import sys
 from pathlib import Path
@@ -66,13 +67,19 @@ def augment(notes: list[list[int]]) -> list[list[int]]:
 
 
 class MidiDataset(Dataset[Tensor]):
-    def __init__(self, root: Path, context: int) -> None:
-        self.paths = sorted(
+    def __init__(self, root: Path, context: int, val_fraction: float = 0.0, val: bool = False,
+                 augment: bool = True, ) -> None:
+        all_paths = sorted(
             path for path in root.rglob("*") if path.is_file() and path.suffix.lower() in (".mid", ".midi")
         )
-        if not self.paths:
+        if not all_paths:
             raise ValueError(f"no .mid or .midi files under {root}")
+        split = max(1, int(len(all_paths) * val_fraction)) if val_fraction else 0
+        self.paths = all_paths[-split:] if val else all_paths[: len(all_paths) - split]
+        if not self.paths:
+            raise ValueError(f"{ 'validation' if val else 'training' } split of {root} is empty")
         self.context = context
+        self.augment = augment
 
     def __len__(self) -> int:
         return len(self.paths)
@@ -83,7 +90,7 @@ class MidiDataset(Dataset[Tensor]):
                 notes = read_midi(self.paths[(index + offset) % len(self.paths)])
             except (EOFError, IndexError, OSError, ValueError, KeySignatureError):
                 continue
-            notes = augment(notes)
+            notes = augment(notes) if self.augment else notes
             break
         else:
             raise RuntimeError("dataset contains no readable MIDI files")
@@ -108,6 +115,18 @@ def masked_log_probability(model: MidiLM, sequence: Tensor) -> Tensor:
     )
 
 
+def field_losses(model: MidiLM, sequences: Tensor) -> Tensor:
+    inputs, targets = sequences[:, :-1], sequences[:, 1:]
+    logits = model(inputs, targets, scheduled_sampling=0.0)
+    mask = targets[..., 0] != 0
+    return sum(
+        (F.cross_entropy(
+            field_logits.flatten(0, 1), targets[..., field].flatten(), reduction="none"
+        ).view_as(mask) * mask).sum() / mask.sum().clamp_min(1)
+        for field, field_logits in enumerate(logits)
+    )
+
+
 def train(args: argparse.Namespace) -> None:
     device = args.device
     output = args.output or args.resume or Path(f"checkpoints/{args.size}.pt")
@@ -116,11 +135,13 @@ def train(args: argparse.Namespace) -> None:
     model = MidiLM(config).to(device)
     if checkpoint:
         model.load_state_dict(checkpoint["model"])
-    dataset = MidiDataset(args.data, config.context)
-    loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.workers)
+    train_split = MidiDataset(args.data, config.context, args.val_fraction, val=False, augment=True)
+    trainer = DataLoader(train_split, batch_size=args.batch_size, shuffle=True, num_workers=args.workers)
+    val_split = MidiDataset(args.data, config.context, args.val_fraction, val=True, augment=False)
+    val_loader = DataLoader(val_split, batch_size=args.batch_size, shuffle=False, num_workers=args.workers)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=0.1)
-    start_epoch = int(checkpoint.get("epoch", 0)) if checkpoint else 0
-    step = int(checkpoint.get("step", 0)) if checkpoint else 0
+    start_epoch = int(checkpoint["epoch"]) if checkpoint else 0
+    step = int(checkpoint["step"]) if checkpoint else 0
     if checkpoint and "optimizer" in checkpoint:
         optimizer.load_state_dict(checkpoint["optimizer"])
         print(f"resuming from epoch {start_epoch}, step {step}")
@@ -128,11 +149,21 @@ def train(args: argparse.Namespace) -> None:
         print("warning: resume checkpoint has no optimizer state; continuing from weights with a fresh optimizer")
     if start_epoch >= args.epochs:
         raise ValueError(f"checkpoint already completed {start_epoch} epochs; --epochs must be larger")
-    total_steps = max(1, args.epochs * len(loader))
+    total_steps = max(1, args.epochs * len(trainer))
+    warmup = max(1, int(total_steps * args.warmup_fraction))
+    def lr(step_at: int) -> float:
+        if step_at < warmup:
+            return (step_at + 1) / warmup
+        progress = (step_at - warmup) / max(1, total_steps - warmup)
+        return 0.5 * (1 + math.cos(math.pi * min(1, progress)))
+    for group in optimizer.param_groups:
+        group["initial_lr"] = group["initial_lr"] if "initial_lr" in group else args.learning_rate
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr, last_epoch=step)
+    best = torch.inf
 
     model.train()
     for epoch in range(start_epoch, args.epochs):
-        progress = tqdm(loader, desc=f"epoch {epoch + 1}/{args.epochs}")
+        progress = tqdm(trainer, desc=f"epoch {epoch + 1}/{args.epochs}")
         for sequence in progress:
             sequence = sequence.to(device)
             inputs, targets = sequence[:, :-1], sequence[:, 1:]
@@ -150,10 +181,28 @@ def train(args: argparse.Namespace) -> None:
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
+            scheduler.step()
             step += 1
-            progress.set_postfix(loss=f"{loss.item():.3f}", scheduled=f"{scheduled:.2f}")
+            progress.set_postfix(loss=f"{loss.item():.3f}", lr=f"{optimizer.param_groups[0]['lr']:.1e}", scheduled=f"{scheduled:.2f}")
         save_checkpoint(output, model)
         save_training_checkpoint(output, model, optimizer, epoch + 1, step)
+        if len(val_split):
+            val = 0.0
+            model.eval()
+            with torch.no_grad():
+                for batch in val_loader:
+                    val += field_losses(model, batch.to(device)).item()
+            model.train()
+            val /= len(val_loader)
+            suffix = output.suffix
+            if val < best:
+                best = val
+                best_path = output.with_name(f"{output.stem}.best{suffix}")
+                save_checkpoint(best_path, model)
+                print(f"val {val:.3f}  (best -> {best_path.name})")
+            else:
+                print(f"val {val:.3f}")
+
 
 
 def preference_sequence(notes: list[list[int]], context: int) -> Tensor:
@@ -261,6 +310,8 @@ def main() -> None:
     fit.add_argument("--batch-size", type=int, default=4)
     fit.add_argument("--workers", type=int, default=0)
     fit.add_argument("--learning-rate", type=float, default=3e-4)
+    fit.add_argument("--warmup-fraction", type=float, default=0.05, help="linear LR warmup as a fraction of total steps")
+    fit.add_argument("--val-fraction", type=float, default=0.05, help="hold-out fraction of MIDI files for validation")
     fit.add_argument("--scheduled-sampling", type=float, default=0.5)
     fit.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
 
