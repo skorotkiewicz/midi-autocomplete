@@ -28,6 +28,34 @@ uv run --extra cpu midilm prepare owner/dataset datasets/my-dataset
 
 The command downloads only MIDI and ZIP files, safely extracts MIDI files from ZIP archives, and reports the number found. Run `hf auth login` first for private or gated datasets. Parquet/Arrow datasets need a small adapter for their specific column schema.
 
+### Example repositories
+
+Small classical piano collection, 228 raw MIDI files, CC BY 4.0:
+
+```sh
+uv run --extra cpu midilm prepare \
+  xenon111/classical-piano-midi \
+  datasets/classical-piano
+```
+
+Larger classical collection, 4,796 raw MIDI files, tagged MIT on its dataset card:
+
+```sh
+uv run --extra cpu midilm prepare \
+  drengskapur/midi-classical-music \
+  datasets/classical-music
+```
+
+Large public-domain piano collection distributed as a ZIP, 10K–100K items, CC BY-NC-SA 4.0:
+
+```sh
+uv run --extra cpu midilm prepare \
+  asigalov61/Pub-Piano-MIDI-Dataset \
+  datasets/pub-piano
+```
+
+Check each dataset card and source-material license before training or distributing a model. A repository license does not necessarily settle the copyright status of every included composition or performance.
+
 ## Train
 
 Pass the prepared directory, or any directory containing piano `.mid` or `.midi` files:

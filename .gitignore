@@ -3,3 +3,4 @@
 /midilm/checkpoints
 __pycache__/
 *.pyc
+/midilm/datasets
