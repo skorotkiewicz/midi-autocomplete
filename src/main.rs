@@ -3,11 +3,16 @@ use gtk4::glib;
 use gtk4::prelude::*;
 use gtk4::{
     Adjustment, Application, ApplicationWindow, Box as GtkBox, Button, DrawingArea, DropDown,
-    Entry, Label, Orientation, SpinButton,
+    Entry, FileChooserAction, FileChooserNative, FileFilter, Label, Orientation, ResponseType,
+    SpinButton,
 };
 use midir::{Ignore, MidiInput, MidiInputConnection, MidiOutput, MidiOutputConnection};
+use rodio::{DeviceSinkBuilder, Player, buffer::SamplesBuffer};
+use rustysynth::{SoundFont, Synthesizer, SynthesizerSettings};
 use std::cell::RefCell;
+use std::fs::File;
 use std::io::{BufRead, BufReader, Write};
+use std::num::{NonZeroU16, NonZeroU32};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::rc::Rc;
@@ -271,7 +276,137 @@ fn prompt(notes: &[Note], bpm: f64) -> String {
         .join(";")
 }
 
-fn play(
+type MidiEvent = (u64, bool, u8, u8);
+
+const SAMPLE_RATE: u32 = 48_000;
+const MAX_PLAYBACK_MS: u64 = 5 * 60 * 1_000;
+
+fn send_midi_events(
+    events: Vec<MidiEvent>,
+    started: Instant,
+    output: Arc<Mutex<Option<MidiOutputConnection>>>,
+) {
+    for (time, on, pitch, velocity) in events {
+        let now = started.elapsed().as_millis() as u64;
+        thread::sleep(Duration::from_millis(time.saturating_sub(now)));
+        if let Some(connection) = output.lock().unwrap().as_mut() {
+            let _ = connection.send(&[if on { 0x90 } else { 0x80 }, pitch, velocity]);
+        }
+    }
+}
+
+fn replay_events(notes: &[Note]) -> Result<Vec<MidiEvent>, String> {
+    let first = notes
+        .iter()
+        .map(|note| note.onset_ms)
+        .min()
+        .ok_or("Nothing to play")?;
+    let end = notes
+        .iter()
+        .map(|note| note.onset_ms + note.duration_ms)
+        .max()
+        .unwrap();
+    if end.saturating_sub(first) > MAX_PLAYBACK_MS {
+        return Err("Playback is limited to five minutes. Clear older notes first.".into());
+    }
+    let mut events = Vec::with_capacity(notes.len() * 2);
+    for note in notes {
+        let onset = 100 + note.onset_ms.saturating_sub(first);
+        events.push((onset, true, note.pitch, note.velocity));
+        events.push((onset + note.duration_ms, false, note.pitch, 0));
+    }
+    events.sort_by_key(|event| (event.0, event.1));
+    Ok(events)
+}
+
+fn render_soundfont(path: &Path, events: &[MidiEvent]) -> Result<Vec<f32>, String> {
+    let mut file =
+        File::open(path).map_err(|error| format!("Could not open SoundFont: {error}"))?;
+    let sound_font = Arc::new(
+        SoundFont::new(&mut file).map_err(|error| format!("Could not load SoundFont: {error}"))?,
+    );
+    let mut settings = SynthesizerSettings::new(SAMPLE_RATE as i32);
+    settings.maximum_polyphony = 128;
+    settings.enable_reverb_and_chorus = true;
+    let mut synth = Synthesizer::new(&sound_font, &settings)
+        .map_err(|error| format!("Could not start synthesizer: {error}"))?;
+    let total_ms = events.last().map_or(0, |event| event.0) + 2_000;
+    let sample_count = (total_ms * SAMPLE_RATE as u64 / 1_000) as usize;
+    // ponytail: offline rendering is simple and bounded to five minutes; stream if longer sessions matter.
+    let mut left = vec![0.0; sample_count];
+    let mut right = vec![0.0; sample_count];
+    let mut position = 0;
+    for &(time, on, pitch, velocity) in events {
+        let next = (time * SAMPLE_RATE as u64 / 1_000) as usize;
+        if next > position {
+            synth.render(&mut left[position..next], &mut right[position..next]);
+            position = next;
+        }
+        if on {
+            synth.note_on(0, pitch as i32, velocity as i32);
+        } else {
+            synth.note_off(0, pitch as i32);
+        }
+    }
+    synth.render(&mut left[position..], &mut right[position..]);
+    let mut samples = Vec::with_capacity(sample_count * 2);
+    for (left, right) in left.into_iter().zip(right) {
+        samples.extend([left, right]);
+    }
+    Ok(samples)
+}
+
+fn replay(
+    notes: Vec<Note>,
+    soundfont: PathBuf,
+    started: Instant,
+    shared: Arc<Mutex<Shared>>,
+    output: Arc<Mutex<Option<MidiOutputConnection>>>,
+) {
+    shared.lock().unwrap().status = "Rendering SoundFont...".into();
+    thread::spawn(move || {
+        let events = match replay_events(&notes) {
+            Ok(events) => events,
+            Err(error) => {
+                shared.lock().unwrap().status = error;
+                return;
+            }
+        };
+        let samples = match render_soundfont(&soundfont, &events) {
+            Ok(samples) => samples,
+            Err(error) => {
+                shared.lock().unwrap().status = error;
+                return;
+            }
+        };
+        let device = match DeviceSinkBuilder::open_default_sink() {
+            Ok(device) => device,
+            Err(error) => {
+                shared.lock().unwrap().status = format!("Could not open audio output: {error}");
+                return;
+            }
+        };
+        let player = Player::connect_new(device.mixer());
+        let base = started.elapsed().as_millis() as u64;
+        let midi_events = events
+            .into_iter()
+            .map(|(time, on, pitch, velocity)| (base + time, on, pitch, velocity))
+            .collect();
+        let midi_output = output.clone();
+        let midi = thread::spawn(move || send_midi_events(midi_events, started, midi_output));
+        shared.lock().unwrap().status = format!("Playing {} notes", notes.len());
+        player.append(SamplesBuffer::new(
+            NonZeroU16::new(2).unwrap(),
+            NonZeroU32::new(SAMPLE_RATE).unwrap(),
+            samples,
+        ));
+        player.sleep_until_end();
+        let _ = midi.join();
+        shared.lock().unwrap().status = "Ready".into();
+    });
+}
+
+fn play_generated(
     generated: Vec<(u8, u64, u64, u8)>,
     bpm: f64,
     started: Instant,
@@ -279,9 +414,17 @@ fn play(
     output: Arc<Mutex<Option<MidiOutputConnection>>>,
 ) {
     let step_ms = 60_000.0 / bpm / 24.0;
-    let base = started.elapsed().as_millis() as u64 + 100;
-    let mut onset = base;
-    let mut events = Vec::new();
+    let live_base = started.elapsed().as_millis() as u64 + 100;
+    let musical_base = shared
+        .lock()
+        .unwrap()
+        .notes
+        .iter()
+        .filter(|note| !note.generated)
+        .map(|note| note.onset_ms)
+        .max()
+        .unwrap_or(0);
+    let mut onset = musical_base;
     let mut notes: Vec<Note> = Vec::new();
     for (pitch, delta, duration, velocity) in generated {
         onset += (delta as f64 * step_ms).round() as u64;
@@ -299,24 +442,20 @@ fn play(
             generated: true,
         });
     }
+    let mut events = Vec::with_capacity(notes.len() * 2);
     for note in &notes {
-        events.push((note.onset_ms, true, note.pitch, note.velocity));
-        events.push((note.onset_ms + note.duration_ms, false, note.pitch, 0));
+        let live_onset = live_base + note.onset_ms.saturating_sub(musical_base);
+        events.push((live_onset, true, note.pitch, note.velocity));
+        events.push((live_onset + note.duration_ms, false, note.pitch, 0));
     }
-    events.sort_by_key(|event| event.0);
+    events.sort_by_key(|event| (event.0, event.1));
     {
         let mut state = shared.lock().unwrap();
         state.notes.extend(notes);
         state.status = format!("Playing {} generated notes", events.len() / 2);
     }
     thread::spawn(move || {
-        for (time, on, pitch, velocity) in events {
-            let now = started.elapsed().as_millis() as u64;
-            thread::sleep(Duration::from_millis(time.saturating_sub(now)));
-            if let Some(connection) = output.lock().unwrap().as_mut() {
-                let _ = connection.send(&[if on { 0x90 } else { 0x80 }, pitch, velocity]);
-            }
-        }
+        send_midi_events(events, started, output);
         shared.lock().unwrap().status = "Ready".to_string();
     });
 }
@@ -365,11 +504,18 @@ fn build_ui(app: &Application) {
         Rc::new(RefCell::new(None));
     let input_names = midi_inputs();
     let output_names = midi_outputs();
+    let has_midi_output = !output_names.is_empty();
     let input_dropdown = dropdown(&input_names);
     let output_dropdown = dropdown(&output_names);
     let connect = Button::with_label("Connect");
     let clear = Button::with_label("Clear");
     let generate = Button::with_label("Autocomplete");
+    let play = Button::with_label("Play");
+    let browse = Button::with_label("Browse");
+    let soundfont = Entry::builder()
+        .placeholder_text("Select a .sf2 SoundFont")
+        .hexpand(true)
+        .build();
     let model = Entry::builder()
         .text("midilm/checkpoints/small.pt")
         .hexpand(true)
@@ -405,17 +551,68 @@ fn build_ui(app: &Application) {
                 return;
             }
         }
-        match connect_output(output_select.selected()) {
-            Ok(connection) => {
-                *output_for_connect.lock().unwrap() = Some(connection);
-                state_for_connect.lock().unwrap().status = "MIDI connected. Play a prompt.".into();
+        if has_midi_output {
+            match connect_output(output_select.selected()) {
+                Ok(connection) => {
+                    *output_for_connect.lock().unwrap() = Some(connection);
+                    state_for_connect.lock().unwrap().status = "MIDI connected. Play a prompt.".into();
+                }
+                Err(error) => state_for_connect.lock().unwrap().status = error,
             }
-            Err(error) => state_for_connect.lock().unwrap().status = error,
+        } else {
+            state_for_connect.lock().unwrap().status =
+                "MIDI input connected. SoundFont playback only.".into();
         }
     });
 
     let state_for_clear = shared.clone();
     clear.connect_clicked(move |_| state_for_clear.lock().unwrap().notes.clear());
+
+    let soundfont_for_browse = soundfont.clone();
+    browse.connect_clicked(move |_| {
+        let chooser = FileChooserNative::builder()
+            .title("Choose a SoundFont")
+            .action(FileChooserAction::Open)
+            .accept_label("Open")
+            .build();
+        let filter = FileFilter::new();
+        filter.set_name(Some("SoundFont files"));
+        filter.add_pattern("*.sf2");
+        filter.add_pattern("*.SF2");
+        chooser.set_filter(&filter);
+        let entry = soundfont_for_browse.clone();
+        chooser.connect_response(move |chooser, response| {
+            if response == ResponseType::Accept
+                && let Some(path) = chooser.file().and_then(|file| file.path())
+            {
+                entry.set_text(&path.to_string_lossy());
+            }
+        });
+        chooser.show();
+    });
+
+    let state_for_play = shared.clone();
+    let output_for_play = output.clone();
+    let soundfont_for_play = soundfont.clone();
+    play.connect_clicked(move |_| {
+        let path = PathBuf::from(soundfont_for_play.text().as_str());
+        if path.as_os_str().is_empty() {
+            state_for_play.lock().unwrap().status = "Choose a .sf2 SoundFont first".into();
+            return;
+        }
+        let notes = state_for_play.lock().unwrap().notes.clone();
+        if notes.is_empty() {
+            state_for_play.lock().unwrap().status = "Nothing to play".into();
+            return;
+        }
+        replay(
+            notes,
+            path,
+            started,
+            state_for_play.clone(),
+            output_for_play.clone(),
+        );
+    });
 
     let (requests, receiver) = mpsc::channel::<GenerationRequest>();
     let worker_state = shared.clone();
@@ -437,7 +634,7 @@ fn build_ui(app: &Application) {
             }
             worker_state.lock().unwrap().status = "Generating...".into();
             match process.as_mut().unwrap().generate(&request.prompt) {
-                Ok(notes) => play(
+                Ok(notes) => play_generated(
                     notes,
                     request.bpm,
                     started,
@@ -499,6 +696,12 @@ fn build_ui(app: &Application) {
     controls.append(&generate);
     controls.append(&clear);
 
+    let playback = GtkBox::new(Orientation::Horizontal, 8);
+    playback.append(&Label::new(Some("SoundFont")));
+    playback.append(&soundfont);
+    playback.append(&browse);
+    playback.append(&play);
+
     let content = GtkBox::new(Orientation::Vertical, 8);
     content.set_margin_top(12);
     content.set_margin_bottom(12);
@@ -506,6 +709,7 @@ fn build_ui(app: &Application) {
     content.set_margin_end(12);
     content.append(&devices);
     content.append(&controls);
+    content.append(&playback);
     content.append(&roll);
     content.append(&status);
 
@@ -530,6 +734,35 @@ fn main() -> glib::ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn replay_normalizes_the_musical_timeline() {
+        let notes = [
+            Note {
+                pitch: 60,
+                onset_ms: 500,
+                duration_ms: 250,
+                velocity: 80,
+                generated: false,
+            },
+            Note {
+                pitch: 64,
+                onset_ms: 1_000,
+                duration_ms: 100,
+                velocity: 90,
+                generated: true,
+            },
+        ];
+        assert_eq!(
+            replay_events(&notes).unwrap(),
+            vec![
+                (100, true, 60, 80),
+                (350, false, 60, 0),
+                (600, true, 64, 90),
+                (700, false, 64, 0),
+            ]
+        );
+    }
 
     #[test]
     fn prompt_quantizes_at_24_steps_per_quarter() {
