@@ -153,9 +153,43 @@ class MidiLM(nn.Module):
         return torch.stack(generated, dim=1) if generated else notes[:, :0]
 
 
-def save_checkpoint(path: Path, model: MidiLM) -> None:
+def atomic_save(path: Path, checkpoint: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save({"config": asdict(model.config), "model": model.state_dict()}, path)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    torch.save(checkpoint, temporary)
+    temporary.replace(path)
+
+
+def save_checkpoint(path: Path, model: MidiLM) -> None:
+    atomic_save(path, {"config": asdict(model.config), "model": model.state_dict()})
+
+
+def resume_checkpoint_path(path: Path) -> Path:
+    return path.with_name(f"{path.stem}.resume{path.suffix}")
+
+
+def save_training_checkpoint(
+    path: Path,
+    model: MidiLM,
+    optimizer: torch.optim.Optimizer,
+    epoch: int,
+    step: int,
+) -> None:
+    atomic_save(
+        resume_checkpoint_path(path),
+        {
+            "config": asdict(model.config),
+            "model": model.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "epoch": epoch,
+            "step": step,
+        },
+    )
+
+
+def load_training_checkpoint(path: Path, device: str) -> dict:
+    sidecar = resume_checkpoint_path(path)
+    return torch.load(sidecar if sidecar.exists() else path, map_location=device, weights_only=True)
 
 
 def load_checkpoint(path: Path, device: str = "cpu") -> MidiLM:

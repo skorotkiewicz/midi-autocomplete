@@ -24,8 +24,11 @@ from .model import (
     decode_note,
     encode_note,
     load_checkpoint,
+    load_training_checkpoint,
     nearest_id,
+    resume_checkpoint_path,
     save_checkpoint,
+    save_training_checkpoint,
 )
 
 BOS = [1, 0, 0, 0, 0]
@@ -107,16 +110,28 @@ def masked_log_probability(model: MidiLM, sequence: Tensor) -> Tensor:
 
 def train(args: argparse.Namespace) -> None:
     device = args.device
-    config = ModelConfig.preset(args.size)
+    output = args.output or args.resume or Path(f"checkpoints/{args.size}.pt")
+    checkpoint = load_training_checkpoint(args.resume, device) if args.resume else None
+    config = ModelConfig(**checkpoint["config"]) if checkpoint else ModelConfig.preset(args.size)
     model = MidiLM(config).to(device)
+    if checkpoint:
+        model.load_state_dict(checkpoint["model"])
     dataset = MidiDataset(args.data, config.context)
     loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.workers)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=0.1)
+    start_epoch = int(checkpoint.get("epoch", 0)) if checkpoint else 0
+    step = int(checkpoint.get("step", 0)) if checkpoint else 0
+    if checkpoint and "optimizer" in checkpoint:
+        optimizer.load_state_dict(checkpoint["optimizer"])
+        print(f"resuming from epoch {start_epoch}, step {step}")
+    elif checkpoint:
+        print("warning: resume checkpoint has no optimizer state; continuing from weights with a fresh optimizer")
+    if start_epoch >= args.epochs:
+        raise ValueError(f"checkpoint already completed {start_epoch} epochs; --epochs must be larger")
     total_steps = max(1, args.epochs * len(loader))
-    step = 0
 
     model.train()
-    for epoch in range(args.epochs):
+    for epoch in range(start_epoch, args.epochs):
         progress = tqdm(loader, desc=f"epoch {epoch + 1}/{args.epochs}")
         for sequence in progress:
             sequence = sequence.to(device)
@@ -137,7 +152,8 @@ def train(args: argparse.Namespace) -> None:
             optimizer.step()
             step += 1
             progress.set_postfix(loss=f"{loss.item():.3f}", scheduled=f"{scheduled:.2f}")
-        save_checkpoint(args.output, model)
+        save_checkpoint(output, model)
+        save_training_checkpoint(output, model, optimizer, epoch + 1, step)
 
 
 def preference_sequence(notes: list[list[int]], context: int) -> Tensor:
@@ -208,7 +224,17 @@ def self_test() -> None:
     augmented = augment([encode_note(60, 0, 24, 80), encode_note(64, 24, 24, 80)])
     assert augmented and all(note[0] == 3 for note in augmented)
     path = Path("/tmp/midilm-self-test.pt")
+    optimizer = torch.optim.AdamW(model.parameters())
+    targets = prompt[:, 1:]
+    loss = sum(logits.mean() for logits in model(prompt[:, :-1], targets))
+    loss.backward()
+    optimizer.step()
     save_checkpoint(path, model)
+    save_training_checkpoint(path, model, optimizer, epoch=3, step=7)
+    resumed = load_training_checkpoint(path, "cpu")
+    assert resumed["epoch"] == 3 and resumed["step"] == 7
+    assert resumed["optimizer"]["state"]
+    assert resume_checkpoint_path(path).exists()
     assert load_checkpoint(path).config == config
     print("midilm self-test passed")
 
@@ -229,8 +255,9 @@ def main() -> None:
     fit = commands.add_parser("train", help="train on a directory of MIDI files")
     fit.add_argument("data", type=Path)
     fit.add_argument("--size", choices=("small", "medium", "large"), default="small")
-    fit.add_argument("--output", type=Path, default=Path("checkpoints/small.pt"))
-    fit.add_argument("--epochs", type=int, default=10)
+    fit.add_argument("--output", type=Path)
+    fit.add_argument("--resume", type=Path, help="resume model, optimizer, epoch, and step from a checkpoint")
+    fit.add_argument("--epochs", type=int, default=10, help="total target epochs, including completed epochs")
     fit.add_argument("--batch-size", type=int, default=4)
     fit.add_argument("--workers", type=int, default=0)
     fit.add_argument("--learning-rate", type=float, default=3e-4)

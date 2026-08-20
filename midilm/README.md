@@ -69,6 +69,21 @@ uv run --extra gpu midilm train /path/to/midi \
 
 The presets are approximately the article's 33M, 64M, and 125M classes. Training sums cross-entropy over all five output heads, applies transposition, tempo, duration, velocity, and dropped-note augmentation, and ramps scheduled sampling to 50%. Corpus selection, cleaning, deduplication, and train/validation splitting remain the caller's job because the original dataset is not public.
 
+After each epoch, training writes a lean GUI checkpoint such as `medium.pt` and a `medium.resume.pt` sidecar containing optimizer and progress state. Resume with the same data and training settings:
+
+```sh
+uv run --extra gpu midilm train /path/to/midi \
+  --resume checkpoints/medium.pt \
+  --epochs 30 \
+  --batch-size 32 \
+  --workers 8 \
+  --learning-rate 2e-4 \
+  --scheduled-sampling 0.5 \
+  --device cuda
+```
+
+`--epochs` is the total target, not the number of additional epochs. Checkpoints created before resume support was added continue from weights with a fresh optimizer and restart epoch counting.
+
 For a quick pipeline check, create an untrained tiny checkpoint. It will produce noise and is not a substitute for training:
 
 ```sh
