@@ -16,7 +16,7 @@ use std::num::{NonZeroU16, NonZeroU32};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::rc::Rc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -39,11 +39,13 @@ struct Shared {
 #[derive(Default)]
 struct PlaybackControl {
     generation: AtomicU64,
+    playing: AtomicBool,
     player: Mutex<Option<Arc<Player>>>,
 }
 
 impl PlaybackControl {
     fn begin(&self) -> u64 {
+        self.playing.store(true, Ordering::SeqCst);
         let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
         if let Some(player) = self.player.lock().unwrap().take() {
             player.stop();
@@ -52,6 +54,7 @@ impl PlaybackControl {
     }
 
     fn stop(&self) {
+        self.playing.store(false, Ordering::SeqCst);
         self.generation.fetch_add(1, Ordering::SeqCst);
         if let Some(player) = self.player.lock().unwrap().take() {
             player.stop();
@@ -60,6 +63,10 @@ impl PlaybackControl {
 
     fn is_active(&self, generation: u64) -> bool {
         self.generation.load(Ordering::SeqCst) == generation
+    }
+
+    fn is_playing(&self) -> bool {
+        self.playing.load(Ordering::SeqCst)
     }
 
     fn set_player(&self, generation: u64, player: Arc<Player>) {
@@ -74,6 +81,7 @@ impl PlaybackControl {
     fn finish(&self, generation: u64) {
         let mut current = self.player.lock().unwrap();
         if self.is_active(generation) {
+            self.playing.store(false, Ordering::SeqCst);
             current.take();
         }
     }
@@ -600,6 +608,7 @@ fn build_ui(app: &Application) {
     let generate = Button::with_label("Autocomplete");
     let play = Button::with_label("Play");
     let stop = Button::with_label("Stop");
+    stop.set_visible(false);
     let browse = Button::with_label("Browse");
     let soundfont = Entry::builder()
         .placeholder_text("Select a .sf2 SoundFont")
@@ -774,10 +783,13 @@ fn build_ui(app: &Application) {
     let roll_for_timer = roll.clone();
     let state_for_timer = shared.clone();
     let status_for_timer = status.clone();
+    let stop_for_timer = stop.clone();
+    let playback_for_timer = playback_control.clone();
     glib::timeout_add_local(Duration::from_millis(33), move || {
         let state = state_for_timer.lock().unwrap();
         status_for_timer.set_text(&format!("{}  |  {} notes", state.status, state.notes.len()));
         drop(state);
+        stop_for_timer.set_visible(playback_for_timer.is_playing());
         roll_for_timer.queue_draw();
         glib::ControlFlow::Continue
     });
@@ -870,7 +882,9 @@ mod tests {
     fn stop_cancels_scheduled_midi_without_waiting() {
         let playback = Arc::new(PlaybackControl::default());
         let generation = playback.begin();
+        assert!(playback.is_playing());
         playback.stop();
+        assert!(!playback.is_playing());
         let started = Instant::now();
         send_midi_events(
             vec![(10_000, true, 60, 80)],
