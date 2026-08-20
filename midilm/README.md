@@ -29,7 +29,7 @@ uv run --extra gpu midilm train /path/to/midi \
   --output checkpoints/small.pt
 ```
 
-The presets are approximately the article's 33M, 64M, and 125M classes. Training sums cross-entropy over all five output heads and ramps scheduled sampling to 50% by default. Corpus selection, cleaning, deduplication, and train/validation splitting remain the caller's job because the original dataset is not public.
+The presets are approximately the article's 33M, 64M, and 125M classes. Training sums cross-entropy over all five output heads, applies transposition, tempo, duration, velocity, and dropped-note augmentation, and ramps scheduled sampling to 50%. Corpus selection, cleaning, deduplication, and train/validation splitting remain the caller's job because the original dataset is not public.
 
 For a quick pipeline check, create an untrained tiny checkpoint. It will produce noise and is not a substitute for training:
 

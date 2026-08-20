@@ -13,11 +13,51 @@ from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
 from .midi import read_midi
-from .model import MidiLM, ModelConfig, decode_note, encode_note, load_checkpoint, save_checkpoint
+from .model import (
+    DELTAS,
+    DURATIONS,
+    VELOCITIES,
+    MidiLM,
+    ModelConfig,
+    decode_note,
+    encode_note,
+    load_checkpoint,
+    nearest_id,
+    save_checkpoint,
+)
 
 BOS = [1, 0, 0, 0, 0]
 EOS = [2, 0, 0, 0, 0]
 PAD = [0, 0, 0, 0, 0]
+
+
+def augment(notes: list[list[int]]) -> list[list[int]]:
+    if not notes:
+        return notes
+    pitches = [note[1] - 1 for note in notes]
+    transpose = random.randint(max(-6, -min(pitches)), min(6, 127 - max(pitches)))
+    tempo = random.uniform(0.9, 1.1)
+    onset = 0
+    performed = []
+    for note in notes:
+        onset += DELTAS[note[2]]
+        performed.append((note[1] - 1 + transpose, onset, DURATIONS[note[3]], VELOCITIES[note[4]]))
+    kept = [note for note in performed if random.random() >= 0.02] or performed[:1]
+    previous_onset = None
+    augmented = []
+    for pitch, onset, duration, velocity in kept:
+        delta = 0 if previous_onset is None else round((onset - previous_onset) * tempo)
+        augmented.append(
+            [
+                3,
+                pitch + 1,
+                nearest_id(delta, DELTAS),
+                nearest_id(round(duration * tempo * random.uniform(0.9, 1.1)), DURATIONS),
+                nearest_id(velocity + random.randint(-4, 4), VELOCITIES),
+            ]
+        )
+        previous_onset = onset
+    return augmented
 
 
 class MidiDataset(Dataset[Tensor]):
@@ -31,7 +71,7 @@ class MidiDataset(Dataset[Tensor]):
         return len(self.paths)
 
     def __getitem__(self, index: int) -> Tensor:
-        notes = read_midi(self.paths[index])
+        notes = augment(read_midi(self.paths[index]))
         if len(notes) >= self.context - 1:
             start = random.randrange(len(notes) - self.context + 2)
             sequence = notes[start : start + self.context - 1]
@@ -151,6 +191,10 @@ def self_test() -> None:
     prompt = torch.tensor([[BOS, encode_note(60, 0, 24, 80)]], dtype=torch.long).reshape(1, 2, 5)
     output = model.generate(prompt, 2)
     assert output.shape == (1, 2, 5)
+    assert torch.all(output[..., 0] == 3)
+    random.seed(0)
+    augmented = augment([encode_note(60, 0, 24, 80), encode_note(64, 24, 24, 80)])
+    assert augmented and all(note[0] == 3 for note in augmented)
     path = Path("/tmp/midilm-self-test.pt")
     save_checkpoint(path, model)
     assert load_checkpoint(path).config == config

@@ -282,10 +282,15 @@ fn play(
     let base = started.elapsed().as_millis() as u64 + 100;
     let mut onset = base;
     let mut events = Vec::new();
-    let mut notes = Vec::new();
+    let mut notes: Vec<Note> = Vec::new();
     for (pitch, delta, duration, velocity) in generated {
         onset += (delta as f64 * step_ms).round() as u64;
         let duration_ms = (duration as f64 * step_ms).round().max(1.0) as u64;
+        if let Some(previous) = notes.iter_mut().rev().find(|note| note.pitch == pitch)
+            && previous.onset_ms + previous.duration_ms > onset
+        {
+            previous.duration_ms = onset.saturating_sub(previous.onset_ms).max(1);
+        }
         notes.push(Note {
             pitch,
             onset_ms: onset,
@@ -293,8 +298,10 @@ fn play(
             velocity,
             generated: true,
         });
-        events.push((onset, true, pitch, velocity));
-        events.push((onset + duration_ms, false, pitch, 0));
+    }
+    for note in &notes {
+        events.push((note.onset_ms, true, note.pitch, note.velocity));
+        events.push((note.onset_ms + note.duration_ms, false, note.pitch, 0));
     }
     events.sort_by_key(|event| event.0);
     {

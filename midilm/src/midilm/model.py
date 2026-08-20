@@ -122,8 +122,10 @@ class MidiLM(nn.Module):
         values = []
         for field, head in enumerate(self.heads):
             logits = head(hidden) / max(temperature, 1e-4)
-            if field == 0 and notes.size(1) < 4:
-                logits[:, 2] = -torch.inf
+            if field == 0:
+                logits[:, [0, 1, 4]] = -torch.inf
+                if notes.size(1) < 4:
+                    logits[:, 2] = -torch.inf
             k = min(top_k, logits.size(-1))
             cutoff = logits.topk(k).values[:, -1, None]
             logits = logits.masked_fill(logits < cutoff, -torch.inf)
