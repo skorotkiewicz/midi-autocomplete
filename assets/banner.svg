@@ -1,0 +1,78 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1400 420" role="img" aria-labelledby="title desc">
+  <title id="title">MIDI Autocomplete</title>
+  <desc id="desc">A dark piano roll with blue input notes, green generated notes, and a red playback cursor.</desc>
+  <defs>
+    <linearGradient id="background" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0a0d12"/>
+      <stop offset="1" stop-color="#111923"/>
+    </linearGradient>
+    <linearGradient id="fade" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#0b1017" stop-opacity="0.98"/>
+      <stop offset="0.72" stop-color="#0b1017" stop-opacity="0.64"/>
+      <stop offset="1" stop-color="#0b1017" stop-opacity="0"/>
+    </linearGradient>
+    <filter id="glow" x="-30%" y="-30%" width="160%" height="160%">
+      <feGaussianBlur stdDeviation="7" result="blur"/>
+      <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+    <pattern id="grid" width="64" height="28" patternUnits="userSpaceOnUse">
+      <path d="M64 0H0V28" fill="none" stroke="#ffffff" stroke-opacity="0.055"/>
+    </pattern>
+  </defs>
+
+  <rect width="1400" height="420" rx="24" fill="url(#background)"/>
+  <rect x="670" width="730" height="420" fill="url(#grid)"/>
+
+  <g opacity="0.95">
+    <rect x="706" y="62" width="104" height="13" rx="6.5" fill="#528ff2"/>
+    <rect x="776" y="90" width="142" height="13" rx="6.5" fill="#528ff2"/>
+    <rect x="728" y="118" width="122" height="13" rx="6.5" fill="#528ff2"/>
+    <rect x="850" y="146" width="82" height="13" rx="6.5" fill="#528ff2"/>
+    <rect x="758" y="174" width="168" height="13" rx="6.5" fill="#528ff2"/>
+    <rect x="814" y="202" width="120" height="13" rx="6.5" fill="#528ff2"/>
+    <rect x="704" y="230" width="104" height="13" rx="6.5" fill="#528ff2"/>
+    <rect x="792" y="258" width="146" height="13" rx="6.5" fill="#528ff2"/>
+    <rect x="742" y="286" width="82" height="13" rx="6.5" fill="#528ff2"/>
+    <rect x="848" y="314" width="86" height="13" rx="6.5" fill="#528ff2"/>
+
+    <rect x="966" y="76" width="116" height="13" rx="6.5" fill="#43cb7c"/>
+    <rect x="1018" y="104" width="158" height="13" rx="6.5" fill="#43cb7c"/>
+    <rect x="948" y="132" width="106" height="13" rx="6.5" fill="#43cb7c"/>
+    <rect x="1084" y="160" width="192" height="13" rx="6.5" fill="#43cb7c"/>
+    <rect x="982" y="188" width="148" height="13" rx="6.5" fill="#43cb7c"/>
+    <rect x="1148" y="216" width="94" height="13" rx="6.5" fill="#43cb7c"/>
+    <rect x="956" y="244" width="126" height="13" rx="6.5" fill="#43cb7c"/>
+    <rect x="1056" y="272" width="174" height="13" rx="6.5" fill="#43cb7c"/>
+    <rect x="990" y="300" width="92" height="13" rx="6.5" fill="#43cb7c"/>
+    <rect x="1112" y="328" width="154" height="13" rx="6.5" fill="#43cb7c"/>
+  </g>
+
+  <line x1="948" y1="42" x2="948" y2="356" stroke="#f04d52" stroke-width="3" filter="url(#glow)"/>
+  <circle cx="948" cy="42" r="5" fill="#f04d52"/>
+
+  <rect width="760" height="420" rx="24" fill="url(#fade)"/>
+  <g font-family="Inter, ui-sans-serif, system-ui, sans-serif">
+    <text x="72" y="88" fill="#7faafa" font-size="15" font-weight="700" letter-spacing="4">LIVE PIANO CONTINUATION</text>
+    <text x="68" y="170" fill="#f5f7fa" font-size="66" font-weight="780" letter-spacing="-2">MIDI</text>
+    <text x="68" y="232" fill="#f5f7fa" font-size="66" font-weight="780" letter-spacing="-2">AUTOCOMPLETE</text>
+    <text x="72" y="277" fill="#9ba8b7" font-size="20" font-weight="450">Play a prompt. Generate the next phrase.</text>
+
+    <g font-size="13" font-weight="650" letter-spacing="1.4">
+      <rect x="72" y="320" width="144" height="36" rx="18" fill="#528ff2" fill-opacity="0.13" stroke="#528ff2" stroke-opacity="0.46"/>
+      <text x="94" y="343" fill="#91b6f7">REAL MIDI I/O</text>
+      <rect x="230" y="320" width="174" height="36" rx="18" fill="#43cb7c" fill-opacity="0.12" stroke="#43cb7c" stroke-opacity="0.42"/>
+      <text x="253" y="343" fill="#83dea8">LOCAL INFERENCE</text>
+      <rect x="418" y="320" width="180" height="36" rx="18" fill="#ffffff" fill-opacity="0.04" stroke="#ffffff" stroke-opacity="0.15"/>
+      <text x="441" y="343" fill="#b7c0ca">GTK4 DESKTOP</text>
+    </g>
+  </g>
+
+  <g transform="translate(1170 371)">
+    <rect x="0" y="0" width="22" height="10" rx="5" fill="#528ff2"/>
+    <text x="31" y="10" fill="#7f8b98" font-family="ui-sans-serif, system-ui, sans-serif" font-size="12">INPUT</text>
+    <rect x="92" y="0" width="22" height="10" rx="5" fill="#43cb7c"/>
+    <text x="123" y="10" fill="#7f8b98" font-family="ui-sans-serif, system-ui, sans-serif" font-size="12">MODEL</text>
+  </g>
+
+  <rect x="0.75" y="0.75" width="1398.5" height="418.5" rx="23.25" fill="none" stroke="#ffffff" stroke-opacity="0.09" stroke-width="1.5"/>
+</svg>

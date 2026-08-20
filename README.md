@@ -1,3 +1,5 @@
+![MIDI Autocomplete banner](assets/banner.svg)
+
 # MIDI Autocomplete
 
 A GTK4 desktop piano-continuation app based on Simon Edwardsson's [MIDI autocomplete write-up](https://simedw.com/2026/08/20/midi-autocomplete/).
