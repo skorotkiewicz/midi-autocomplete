@@ -2,8 +2,8 @@ use gtk4::cairo;
 use gtk4::glib;
 use gtk4::prelude::*;
 use gtk4::{
-    Adjustment, Application, ApplicationWindow, Box as GtkBox, Button, DrawingArea, DropDown, Entry,
-    Label, Orientation, SpinButton,
+    Adjustment, Application, ApplicationWindow, Box as GtkBox, Button, DrawingArea, DropDown,
+    Entry, Label, Orientation, SpinButton,
 };
 use midir::{Ignore, MidiInput, MidiInputConnection, MidiOutput, MidiOutputConnection};
 use std::cell::RefCell;
@@ -12,7 +12,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::rc::Rc;
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -122,7 +122,15 @@ impl ModelProcess {
             .canonicalize()
             .map_err(|error| format!("Model not found: {error}"))?;
         let mut child = Command::new("uv")
-            .args(["run", "--directory", "midilm", "--extra", "cpu", "midilm", "serve"])
+            .args([
+                "run",
+                "--directory",
+                "midilm",
+                "--extra",
+                "cpu",
+                "midilm",
+                "serve",
+            ])
             .arg(&checkpoint)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -132,7 +140,9 @@ impl ModelProcess {
         let input = child.stdin.take().ok_or("Could not open model input")?;
         let mut output = BufReader::new(child.stdout.take().ok_or("Could not open model output")?);
         let mut ready = String::new();
-        output.read_line(&mut ready).map_err(|error| error.to_string())?;
+        output
+            .read_line(&mut ready)
+            .map_err(|error| error.to_string())?;
         if !ready.starts_with("ready\t") {
             return Err(format!("Model failed to start: {}", ready.trim()));
         }
@@ -145,11 +155,17 @@ impl ModelProcess {
     }
 
     fn generate(&mut self, prompt: &str) -> Result<Vec<(u8, u64, u64, u8)>, String> {
-        writeln!(self.input, "generate\t32\t0.9\t16\t{prompt}").map_err(|error| error.to_string())?;
+        writeln!(self.input, "generate\t32\t0.9\t16\t{prompt}")
+            .map_err(|error| error.to_string())?;
         self.input.flush().map_err(|error| error.to_string())?;
         let mut response = String::new();
-        self.output.read_line(&mut response).map_err(|error| error.to_string())?;
-        let (kind, body) = response.trim_end().split_once('\t').unwrap_or(("error", "empty response"));
+        self.output
+            .read_line(&mut response)
+            .map_err(|error| error.to_string())?;
+        let (kind, body) = response
+            .trim_end()
+            .split_once('\t')
+            .unwrap_or(("error", "empty response"));
         if kind != "notes" {
             return Err(body.to_string());
         }
@@ -213,7 +229,9 @@ fn connect_input(
         .connect(
             port,
             "midi-autocomplete-input",
-            move |_, message, _| capture.receive(message, started.elapsed().as_millis() as u64, &shared),
+            move |_, message, _| {
+                capture.receive(message, started.elapsed().as_millis() as u64, &shared)
+            },
             (),
         )
         .map_err(|error| error.to_string())
@@ -229,7 +247,11 @@ fn connect_output(selected: u32) -> Result<MidiOutputConnection, String> {
 }
 
 fn prompt(notes: &[Note], bpm: f64) -> String {
-    let mut notes: Vec<_> = notes.iter().filter(|note| !note.generated).copied().collect();
+    let mut notes: Vec<_> = notes
+        .iter()
+        .filter(|note| !note.generated)
+        .copied()
+        .collect();
     notes.sort_by_key(|note| (note.onset_ms, note.pitch));
     let step_ms = 60_000.0 / bpm / 24.0;
     let mut previous = 0;
@@ -265,7 +287,13 @@ fn play(
     for (pitch, delta, duration, velocity) in generated {
         onset += (delta as f64 * step_ms).round() as u64;
         let duration_ms = (duration as f64 * step_ms).round().max(1.0) as u64;
-        notes.push(Note { pitch, onset_ms: onset, duration_ms, velocity, generated: true });
+        notes.push(Note {
+            pitch,
+            onset_ms: onset,
+            duration_ms,
+            velocity,
+            generated: true,
+        });
         events.push((onset, true, pitch, velocity));
         events.push((onset + duration_ms, false, pitch, 0));
     }
@@ -290,7 +318,12 @@ fn play(
 fn draw_roll(cr: &cairo::Context, width: i32, height: i32, notes: &[Note]) {
     cr.set_source_rgb(0.07, 0.08, 0.10);
     let _ = cr.paint();
-    let end = notes.iter().map(|note| note.onset_ms + note.duration_ms).max().unwrap_or(15_000).max(15_000);
+    let end = notes
+        .iter()
+        .map(|note| note.onset_ms + note.duration_ms)
+        .max()
+        .unwrap_or(15_000)
+        .max(15_000);
     let start = end.saturating_sub(15_000);
     for pitch in 21..=108 {
         let y = height as f64 * (108 - pitch) as f64 / 88.0;
@@ -317,9 +350,13 @@ fn draw_roll(cr: &cairo::Context, width: i32, height: i32, notes: &[Note]) {
 
 fn build_ui(app: &Application) {
     let started = Instant::now();
-    let shared = Arc::new(Mutex::new(Shared { status: "Connect MIDI devices".into(), ..Default::default() }));
+    let shared = Arc::new(Mutex::new(Shared {
+        status: "Connect MIDI devices".into(),
+        ..Default::default()
+    }));
     let output: Arc<Mutex<Option<MidiOutputConnection>>> = Arc::new(Mutex::new(None));
-    let input_connection: Rc<RefCell<Option<MidiInputConnection<()>>>> = Rc::new(RefCell::new(None));
+    let input_connection: Rc<RefCell<Option<MidiInputConnection<()>>>> =
+        Rc::new(RefCell::new(None));
     let input_names = midi_inputs();
     let output_names = midi_outputs();
     let input_dropdown = dropdown(&input_names);
@@ -327,14 +364,27 @@ fn build_ui(app: &Application) {
     let connect = Button::with_label("Connect");
     let clear = Button::with_label("Clear");
     let generate = Button::with_label("Autocomplete");
-    let model = Entry::builder().text("midilm/checkpoints/small.pt").hexpand(true).build();
-    let bpm = SpinButton::new(Some(&Adjustment::new(120.0, 30.0, 300.0, 1.0, 10.0, 0.0)), 1.0, 0);
+    let model = Entry::builder()
+        .text("midilm/checkpoints/small.pt")
+        .hexpand(true)
+        .build();
+    let bpm = SpinButton::new(
+        Some(&Adjustment::new(120.0, 30.0, 300.0, 1.0, 10.0, 0.0)),
+        1.0,
+        0,
+    );
     let status = Label::new(None);
     status.set_xalign(0.0);
-    let roll = DrawingArea::builder().content_height(420).hexpand(true).vexpand(true).build();
+    let roll = DrawingArea::builder()
+        .content_height(420)
+        .hexpand(true)
+        .vexpand(true)
+        .build();
 
     let state_for_draw = shared.clone();
-    roll.set_draw_func(move |_, cr, width, height| draw_roll(cr, width, height, &state_for_draw.lock().unwrap().notes));
+    roll.set_draw_func(move |_, cr, width, height| {
+        draw_roll(cr, width, height, &state_for_draw.lock().unwrap().notes)
+    });
 
     let input_for_connect = input_connection.clone();
     let output_for_connect = output.clone();
@@ -367,7 +417,9 @@ fn build_ui(app: &Application) {
     thread::spawn(move || {
         let mut process: Option<ModelProcess> = None;
         while let Ok(request) = receiver.recv() {
-            let restart = process.as_ref().is_none_or(|current| current.checkpoint != request.checkpoint.canonicalize().unwrap_or_default());
+            let restart = process.as_ref().is_none_or(|current| {
+                current.checkpoint != request.checkpoint.canonicalize().unwrap_or_default()
+            });
             if restart {
                 process = match ModelProcess::start(&request.checkpoint) {
                     Ok(model) => Some(model),
@@ -379,7 +431,13 @@ fn build_ui(app: &Application) {
             }
             worker_state.lock().unwrap().status = "Generating...".into();
             match process.as_mut().unwrap().generate(&request.prompt) {
-                Ok(notes) => play(notes, request.bpm, started, worker_state.clone(), worker_output.clone()),
+                Ok(notes) => play(
+                    notes,
+                    request.bpm,
+                    started,
+                    worker_state.clone(),
+                    worker_output.clone(),
+                ),
                 Err(error) => {
                     worker_state.lock().unwrap().status = error;
                     process = None;
@@ -396,7 +454,8 @@ fn build_ui(app: &Application) {
         let input_notes = state.notes.iter().filter(|note| !note.generated).count();
         if input_notes == 0 {
             drop(state);
-            state_for_generate.lock().unwrap().status = "Play at least one complete note first".into();
+            state_for_generate.lock().unwrap().status =
+                "Play at least one complete note first".into();
             return;
         }
         let request = GenerationRequest {
@@ -455,7 +514,9 @@ fn build_ui(app: &Application) {
 }
 
 fn main() -> glib::ExitCode {
-    let app = Application::builder().application_id("com.skorotkiewicz.midi-autocomplete").build();
+    let app = Application::builder()
+        .application_id("com.skorotkiewicz.midi-autocomplete")
+        .build();
     app.connect_activate(build_ui);
     app.run()
 }
@@ -466,7 +527,13 @@ mod tests {
 
     #[test]
     fn prompt_quantizes_at_24_steps_per_quarter() {
-        let notes = [Note { pitch: 60, onset_ms: 500, duration_ms: 250, velocity: 80, generated: false }];
+        let notes = [Note {
+            pitch: 60,
+            onset_ms: 500,
+            duration_ms: 250,
+            velocity: 80,
+            generated: false,
+        }];
         assert_eq!(prompt(&notes, 120.0), "60,24,12,80");
     }
 }
