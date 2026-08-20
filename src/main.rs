@@ -16,6 +16,7 @@ use std::num::{NonZeroU16, NonZeroU32};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -33,6 +34,49 @@ struct Note {
 struct Shared {
     notes: Vec<Note>,
     status: String,
+}
+
+#[derive(Default)]
+struct PlaybackControl {
+    generation: AtomicU64,
+    player: Mutex<Option<Arc<Player>>>,
+}
+
+impl PlaybackControl {
+    fn begin(&self) -> u64 {
+        let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
+        if let Some(player) = self.player.lock().unwrap().take() {
+            player.stop();
+        }
+        generation
+    }
+
+    fn stop(&self) {
+        self.generation.fetch_add(1, Ordering::SeqCst);
+        if let Some(player) = self.player.lock().unwrap().take() {
+            player.stop();
+        }
+    }
+
+    fn is_active(&self, generation: u64) -> bool {
+        self.generation.load(Ordering::SeqCst) == generation
+    }
+
+    fn set_player(&self, generation: u64, player: Arc<Player>) {
+        let mut current = self.player.lock().unwrap();
+        if self.is_active(generation) {
+            *current = Some(player);
+        } else {
+            player.stop();
+        }
+    }
+
+    fn finish(&self, generation: u64) {
+        let mut current = self.player.lock().unwrap();
+        if self.is_active(generation) {
+            current.take();
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -285,10 +329,24 @@ fn send_midi_events(
     events: Vec<MidiEvent>,
     started: Instant,
     output: Arc<Mutex<Option<MidiOutputConnection>>>,
+    playback: Arc<PlaybackControl>,
+    generation: u64,
 ) {
     for (time, on, pitch, velocity) in events {
-        let now = started.elapsed().as_millis() as u64;
-        thread::sleep(Duration::from_millis(time.saturating_sub(now)));
+        loop {
+            if !playback.is_active(generation) {
+                if let Some(connection) = output.lock().unwrap().as_mut() {
+                    let _ = connection.send(&[0xb0, 120, 0]);
+                    let _ = connection.send(&[0xb0, 123, 0]);
+                }
+                return;
+            }
+            let remaining = time.saturating_sub(started.elapsed().as_millis() as u64);
+            if remaining == 0 {
+                break;
+            }
+            thread::sleep(Duration::from_millis(remaining.min(10)));
+        }
         if let Some(connection) = output.lock().unwrap().as_mut() {
             let _ = connection.send(&[if on { 0x90 } else { 0x80 }, pitch, velocity]);
         }
@@ -362,38 +420,59 @@ fn replay(
     started: Instant,
     shared: Arc<Mutex<Shared>>,
     output: Arc<Mutex<Option<MidiOutputConnection>>>,
+    playback: Arc<PlaybackControl>,
 ) {
+    let generation = playback.begin();
     shared.lock().unwrap().status = "Rendering SoundFont...".into();
     thread::spawn(move || {
         let events = match replay_events(&notes) {
             Ok(events) => events,
             Err(error) => {
-                shared.lock().unwrap().status = error;
+                if playback.is_active(generation) {
+                    shared.lock().unwrap().status = error;
+                }
+                playback.finish(generation);
                 return;
             }
         };
         let samples = match render_soundfont(&soundfont, &events) {
             Ok(samples) => samples,
             Err(error) => {
-                shared.lock().unwrap().status = error;
+                if playback.is_active(generation) {
+                    shared.lock().unwrap().status = error;
+                }
+                playback.finish(generation);
                 return;
             }
         };
+        if !playback.is_active(generation) {
+            return;
+        }
         let device = match DeviceSinkBuilder::open_default_sink() {
             Ok(device) => device,
             Err(error) => {
-                shared.lock().unwrap().status = format!("Could not open audio output: {error}");
+                if playback.is_active(generation) {
+                    shared.lock().unwrap().status = format!("Could not open audio output: {error}");
+                }
+                playback.finish(generation);
                 return;
             }
         };
-        let player = Player::connect_new(device.mixer());
+        let player = Arc::new(Player::connect_new(device.mixer()));
+        playback.set_player(generation, player.clone());
+        if !playback.is_active(generation) {
+            return;
+        }
         let base = started.elapsed().as_millis() as u64;
         let midi_events = events
             .into_iter()
             .map(|(time, on, pitch, velocity)| (base + time, on, pitch, velocity))
             .collect();
         let midi_output = output.clone();
-        let midi = thread::spawn(move || send_midi_events(midi_events, started, midi_output));
+        let midi_playback = playback.clone();
+        let midi = thread::spawn(move || {
+            send_midi_events(midi_events, started, midi_output, midi_playback, generation)
+        });
         shared.lock().unwrap().status = format!("Playing {} notes", notes.len());
         player.append(SamplesBuffer::new(
             NonZeroU16::new(2).unwrap(),
@@ -402,7 +481,10 @@ fn replay(
         ));
         player.sleep_until_end();
         let _ = midi.join();
-        shared.lock().unwrap().status = "Ready".into();
+        if playback.is_active(generation) {
+            shared.lock().unwrap().status = "Ready".into();
+        }
+        playback.finish(generation);
     });
 }
 
@@ -412,7 +494,9 @@ fn play_generated(
     started: Instant,
     shared: Arc<Mutex<Shared>>,
     output: Arc<Mutex<Option<MidiOutputConnection>>>,
+    playback: Arc<PlaybackControl>,
 ) {
+    let generation = playback.begin();
     let step_ms = 60_000.0 / bpm / 24.0;
     let live_base = started.elapsed().as_millis() as u64 + 100;
     let musical_base = shared
@@ -455,8 +539,11 @@ fn play_generated(
         state.status = format!("Playing {} generated notes", events.len() / 2);
     }
     thread::spawn(move || {
-        send_midi_events(events, started, output);
-        shared.lock().unwrap().status = "Ready".to_string();
+        send_midi_events(events, started, output, playback.clone(), generation);
+        if playback.is_active(generation) {
+            shared.lock().unwrap().status = "Ready".to_string();
+        }
+        playback.finish(generation);
     });
 }
 
@@ -500,6 +587,7 @@ fn build_ui(app: &Application) {
         ..Default::default()
     }));
     let output: Arc<Mutex<Option<MidiOutputConnection>>> = Arc::new(Mutex::new(None));
+    let playback_control = Arc::new(PlaybackControl::default());
     let input_connection: Rc<RefCell<Option<MidiInputConnection<()>>>> =
         Rc::new(RefCell::new(None));
     let input_names = midi_inputs();
@@ -511,6 +599,7 @@ fn build_ui(app: &Application) {
     let clear = Button::with_label("Clear");
     let generate = Button::with_label("Autocomplete");
     let play = Button::with_label("Play");
+    let stop = Button::with_label("Stop");
     let browse = Button::with_label("Browse");
     let soundfont = Entry::builder()
         .placeholder_text("Select a .sf2 SoundFont")
@@ -555,7 +644,8 @@ fn build_ui(app: &Application) {
             match connect_output(output_select.selected()) {
                 Ok(connection) => {
                     *output_for_connect.lock().unwrap() = Some(connection);
-                    state_for_connect.lock().unwrap().status = "MIDI connected. Play a prompt.".into();
+                    state_for_connect.lock().unwrap().status =
+                        "MIDI connected. Play a prompt.".into();
                 }
                 Err(error) => state_for_connect.lock().unwrap().status = error,
             }
@@ -593,6 +683,7 @@ fn build_ui(app: &Application) {
 
     let state_for_play = shared.clone();
     let output_for_play = output.clone();
+    let playback_for_play = playback_control.clone();
     let soundfont_for_play = soundfont.clone();
     play.connect_clicked(move |_| {
         let path = PathBuf::from(soundfont_for_play.text().as_str());
@@ -611,12 +702,21 @@ fn build_ui(app: &Application) {
             started,
             state_for_play.clone(),
             output_for_play.clone(),
+            playback_for_play.clone(),
         );
+    });
+
+    let state_for_stop = shared.clone();
+    let playback_for_stop = playback_control.clone();
+    stop.connect_clicked(move |_| {
+        playback_for_stop.stop();
+        state_for_stop.lock().unwrap().status = "Stopped".into();
     });
 
     let (requests, receiver) = mpsc::channel::<GenerationRequest>();
     let worker_state = shared.clone();
     let worker_output = output.clone();
+    let worker_playback = playback_control.clone();
     thread::spawn(move || {
         let mut process: Option<ModelProcess> = None;
         while let Ok(request) = receiver.recv() {
@@ -640,6 +740,7 @@ fn build_ui(app: &Application) {
                     started,
                     worker_state.clone(),
                     worker_output.clone(),
+                    worker_playback.clone(),
                 ),
                 Err(error) => {
                     worker_state.lock().unwrap().status = error;
@@ -701,6 +802,7 @@ fn build_ui(app: &Application) {
     playback.append(&soundfont);
     playback.append(&browse);
     playback.append(&play);
+    playback.append(&stop);
 
     let content = GtkBox::new(Orientation::Vertical, 8);
     content.set_margin_top(12);
@@ -762,6 +864,22 @@ mod tests {
                 (700, false, 64, 0),
             ]
         );
+    }
+
+    #[test]
+    fn stop_cancels_scheduled_midi_without_waiting() {
+        let playback = Arc::new(PlaybackControl::default());
+        let generation = playback.begin();
+        playback.stop();
+        let started = Instant::now();
+        send_midi_events(
+            vec![(10_000, true, 60, 80)],
+            started,
+            Arc::new(Mutex::new(None)),
+            playback,
+            generation,
+        );
+        assert!(started.elapsed() < Duration::from_millis(100));
     }
 
     #[test]
