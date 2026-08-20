@@ -77,10 +77,11 @@ class MidiDataset(Dataset[Tensor]):
     def __getitem__(self, index: int) -> Tensor:
         for offset in range(len(self.paths)):
             try:
-                notes = augment(read_midi(self.paths[(index + offset) % len(self.paths)]))
-                break
-            except (EOFError, OSError, ValueError, KeySignatureError):
+                notes = read_midi(self.paths[(index + offset) % len(self.paths)])
+            except (EOFError, IndexError, OSError, ValueError, KeySignatureError):
                 continue
+            notes = augment(notes)
+            break
         else:
             raise RuntimeError("dataset contains no readable MIDI files")
         if len(notes) >= self.context - 1:
