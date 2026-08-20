@@ -30,6 +30,7 @@ from .model import (
     resume_checkpoint_path,
     save_checkpoint,
     save_training_checkpoint,
+    save_training_state,
 )
 
 BOS = [1, 0, 0, 0, 0]
@@ -128,6 +129,11 @@ def field_losses(model: MidiLM, sequences: Tensor) -> Tensor:
 
 
 def train(args: argparse.Namespace) -> None:
+    if args.seed is not None:
+        random.seed(args.seed)
+        torch.manual_seed(args.seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(args.seed)
     device = args.device
     output = args.output or args.resume or Path(f"checkpoints/{args.size}.pt")
     checkpoint = load_training_checkpoint(args.resume, device) if args.resume else None
@@ -149,21 +155,34 @@ def train(args: argparse.Namespace) -> None:
         print("warning: resume checkpoint has no optimizer state; continuing from weights with a fresh optimizer")
     if start_epoch >= args.epochs:
         raise ValueError(f"checkpoint already completed {start_epoch} epochs; --epochs must be larger")
-    total_steps = max(1, args.epochs * len(trainer))
+    total_steps = max(1, args.epochs * len(trainer) // args.grad_accum)
     warmup = max(1, int(total_steps * args.warmup_fraction))
+
     def lr(step_at: int) -> float:
         if step_at < warmup:
             return (step_at + 1) / warmup
         progress = (step_at - warmup) / max(1, total_steps - warmup)
         return 0.5 * (1 + math.cos(math.pi * min(1, progress)))
+
     for group in optimizer.param_groups:
-        group["initial_lr"] = group["initial_lr"] if "initial_lr" in group else args.learning_rate
+        group["initial_lr"] = args.learning_rate
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr, last_epoch=step)
     best = torch.inf
+
+    def take_step() -> None:
+        nonlocal step
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        optimizer.step()
+        optimizer.zero_grad(set_to_none=True)
+        scheduler.step()
+        step += 1
+        if args.checkpoint_every and step % args.checkpoint_every == 0:
+            save_training_checkpoint(output, model, optimizer, epoch + 1, step)
 
     model.train()
     for epoch in range(start_epoch, args.epochs):
         progress = tqdm(trainer, desc=f"epoch {epoch + 1}/{args.epochs}")
+        micro = 0
         for sequence in progress:
             sequence = sequence.to(device)
             inputs, targets = sequence[:, :-1], sequence[:, 1:]
@@ -176,14 +195,14 @@ def train(args: argparse.Namespace) -> None:
                     field_logits.flatten(0, 1), targets[..., field].flatten(), reduction="none"
                 ).view_as(mask)
                 losses.append((per_note * mask).sum() / mask.sum().clamp_min(1))
-            loss = sum(losses)
-            optimizer.zero_grad(set_to_none=True)
+            loss = sum(losses) / args.grad_accum
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
-            scheduler.step()
-            step += 1
-            progress.set_postfix(loss=f"{loss.item():.3f}", lr=f"{optimizer.param_groups[0]['lr']:.1e}", scheduled=f"{scheduled:.2f}")
+            micro += 1
+            if micro % args.grad_accum == 0:
+                take_step()
+            progress.set_postfix(loss=f"{sum(losses).item():.3f}", lr=f"{optimizer.param_groups[0]['lr']:.1e}", scheduled=f"{scheduled:.2f}")
+        if micro % args.grad_accum != 0:
+            take_step()
         save_checkpoint(output, model)
         save_training_checkpoint(output, model, optimizer, epoch + 1, step)
         if len(val_split):
@@ -199,6 +218,8 @@ def train(args: argparse.Namespace) -> None:
                 best = val
                 best_path = output.with_name(f"{output.stem}.best{suffix}")
                 save_checkpoint(best_path, model)
+                best_resume = output.with_name(f"{output.stem}.best.resume{suffix}")
+                save_training_state(best_resume, model, optimizer, epoch + 1, step)
                 print(f"val {val:.3f}  (best -> {best_path.name})")
             else:
                 print(f"val {val:.3f}")
@@ -314,6 +335,9 @@ def main() -> None:
     fit.add_argument("--val-fraction", type=float, default=0.05, help="hold-out fraction of MIDI files for validation")
     fit.add_argument("--scheduled-sampling", type=float, default=0.5)
     fit.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    fit.add_argument("--grad-accum", type=int, default=1, help="accumulate gradients over N batches before one optimizer step")
+    fit.add_argument("--checkpoint-every", type=int, default=0, help="save a resume checkpoint every N optimizer steps (0 disables)")
+    fit.add_argument("--seed", type=int, default=None, help="random seed for reproducible runs")
 
     preference = commands.add_parser("dpo", help="post-train on preference JSONL")
     preference.add_argument("checkpoint", type=Path)

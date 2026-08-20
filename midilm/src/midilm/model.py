@@ -168,7 +168,7 @@ def resume_checkpoint_path(path: Path) -> Path:
     return path.with_name(f"{path.stem}.resume{path.suffix}")
 
 
-def save_training_checkpoint(
+def save_training_state(
     path: Path,
     model: MidiLM,
     optimizer: torch.optim.Optimizer,
@@ -176,7 +176,7 @@ def save_training_checkpoint(
     step: int,
 ) -> None:
     atomic_save(
-        resume_checkpoint_path(path),
+        path,
         {
             "config": asdict(model.config),
             "model": model.state_dict(),
@@ -185,6 +185,16 @@ def save_training_checkpoint(
             "step": step,
         },
     )
+
+
+def save_training_checkpoint(
+    path: Path,
+    model: MidiLM,
+    optimizer: torch.optim.Optimizer,
+    epoch: int,
+    step: int,
+) -> None:
+    save_training_state(resume_checkpoint_path(path), model, optimizer, epoch, step)
 
 
 def load_training_checkpoint(path: Path, device: str) -> dict:
