@@ -135,7 +135,12 @@ def train(args: argparse.Namespace) -> None:
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(args.seed)
     device = args.device
-    output = args.output or args.resume or Path(f"checkpoints/{args.size}.pt")
+    if args.output:
+        output = args.output
+    elif args.resume and not str(args.resume).startswith(("https://", "http://")):
+        output = args.resume
+    else:
+        output = Path(f"checkpoints/{args.size}.pt")
     checkpoint = load_training_checkpoint(args.resume, device) if args.resume else None
     config = ModelConfig(**checkpoint["config"]) if checkpoint else ModelConfig.preset(args.size)
     model = MidiLM(config).to(device)

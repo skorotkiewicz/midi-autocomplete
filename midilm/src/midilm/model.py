@@ -164,6 +164,30 @@ def save_checkpoint(path: Path, model: MidiLM) -> None:
     atomic_save(path, {"config": asdict(model.config), "model": model.state_dict()})
 
 
+def parse_hf_url(url: str) -> tuple[str, str, str]:
+    """Split a Hugging Face resolve URL into (repo_id, revision, filename)."""
+    from urllib.parse import urlparse
+
+    parsed = urlparse(url)
+    if parsed.netloc != "huggingface.co":
+        raise ValueError(f"not a Hugging Face URL: {url}")
+    parts = [part for part in parsed.path.split("/") if part]
+    if len(parts) < 5 or parts[2] != "resolve":
+        raise ValueError(f"expected a /<repo>/resolve/<revision>/<file> URL, got: {url}")
+    return f"{parts[0]}/{parts[1]}", parts[3], "/".join(parts[4:])
+
+
+def local_checkpoint_path(path: str | Path) -> Path:
+    """Resolve an HF resolve URL to a locally cached file; other paths pass through."""
+    text = str(path)
+    if not text.startswith(("https://huggingface.co/", "http://huggingface.co/")):
+        return Path(text)
+    repo_id, revision, filename = parse_hf_url(text)
+    from huggingface_hub import hf_hub_download
+
+    return Path(hf_hub_download(repo_id=repo_id, filename=filename, revision=revision))
+
+
 def resume_checkpoint_path(path: Path) -> Path:
     return path.with_name(f"{path.stem}.resume{path.suffix}")
 
@@ -198,11 +222,13 @@ def save_training_checkpoint(
 
 
 def load_training_checkpoint(path: Path, device: str) -> dict:
+    path = local_checkpoint_path(path)
     sidecar = resume_checkpoint_path(path)
     return torch.load(sidecar if sidecar.exists() else path, map_location=device, weights_only=True)
 
 
 def load_checkpoint(path: Path, device: str = "cpu") -> MidiLM:
+    path = local_checkpoint_path(path)
     checkpoint = torch.load(path, map_location=device, weights_only=True)
     model = MidiLM(ModelConfig(**checkpoint["config"]))
     model.load_state_dict(checkpoint["model"])

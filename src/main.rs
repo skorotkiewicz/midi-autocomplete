@@ -296,13 +296,14 @@ struct ModelProcess {
 impl ModelProcess {
     fn start(checkpoint: &Path) -> Result<Self, String> {
         let root = repo_root();
-        let checkpoint = if checkpoint.is_absolute() {
-            checkpoint.to_path_buf()
+        let checkpoint = resolve_model_path(checkpoint);
+        let checkpoint = if is_remote_url(&checkpoint) {
+            checkpoint
         } else {
-            root.join(checkpoint)
-        }
-        .canonicalize()
-        .map_err(|error| format!("Model not found: {error}"))?;
+            checkpoint
+                .canonicalize()
+                .map_err(|error| format!("Model not found: {error}"))?
+        };
         let mut child = Command::new("uv")
             .args([
                 "run",
@@ -396,6 +397,26 @@ fn midi_outputs() -> Vec<String> {
 /// work no matter what directory the process was launched from.
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+}
+
+fn is_remote_url(path: &Path) -> bool {
+    let text = path.to_string_lossy();
+    text.starts_with("https://") || text.starts_with("http://")
+}
+
+/// Resolve a checkpoint path for launching the model worker. Remote Hugging
+/// Face URLs pass through unchanged; local paths are made absolute against the
+/// repo root when relative, then canonicalized when the file exists.
+fn resolve_model_path(path: &Path) -> PathBuf {
+    if is_remote_url(path) {
+        return path.to_path_buf();
+    }
+    let joined = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        repo_root().join(path)
+    };
+    joined.canonicalize().unwrap_or(joined)
 }
 
 /// Send all-notes-off + reset to the connected output so notes don't hang when
@@ -853,7 +874,7 @@ fn build_ui(app: &Application) {
     }
     let config = Arc::new(Mutex::new(initial_config));
     let model = Entry::builder()
-        .text("midilm/checkpoints/small.pt")
+        .text("https://huggingface.co/Grizzlykw/midilm/resolve/main/medium.resume.pt?download=true")
         .hexpand(true)
         .build();
     let bpm = SpinButton::new(
@@ -1115,7 +1136,7 @@ fn build_ui(app: &Application) {
         let mut process: Option<ModelProcess> = None;
         while let Ok(request) = receiver.recv() {
             let restart = process.as_ref().is_none_or(|current| {
-                current.checkpoint != request.checkpoint.canonicalize().unwrap_or_default()
+                current.checkpoint != resolve_model_path(&request.checkpoint)
             });
             if restart {
                 process = match ModelProcess::start(&request.checkpoint) {
@@ -1296,6 +1317,18 @@ mod tests {
     }
 
     #[test]
+    fn model_path_passes_urls_through_and_resolves_locals_from_repo_root() {
+        let url =
+            "https://huggingface.co/Grizzlykw/midilm/resolve/main/medium.resume.pt?download=true";
+        assert_eq!(resolve_model_path(Path::new(url)), PathBuf::from(url));
+        let missing = Path::new("midilm/checkpoints/nope.pt");
+        assert_eq!(
+            resolve_model_path(missing),
+            repo_root().join("midilm/checkpoints/nope.pt")
+        );
+    }
+
+    #[test]
     fn playhead_maps_wall_time_to_musical_time() {
         let playback = PlaybackControl::default();
         let generation = playback.begin();
@@ -1415,7 +1448,10 @@ mod tests {
         fn input_port_matches_config() {
             let name = board_name("input").expect("midi_input set in config");
             let present = midi_inputs().iter().any(|candidate| candidate == &name);
-            assert!(present, "input device '{name}' should appear in midi_inputs()");
+            assert!(
+                present,
+                "input device '{name}' should appear in midi_inputs()"
+            );
         }
 
         #[test]
@@ -1423,7 +1459,10 @@ mod tests {
         fn output_port_matches_config() {
             let name = board_name("output").expect("midi_output set in config");
             let present = midi_outputs().iter().any(|candidate| candidate == &name);
-            assert!(present, "output device '{name}' should appear in midi_outputs()");
+            assert!(
+                present,
+                "output device '{name}' should appear in midi_outputs()"
+            );
         }
 
         #[test]
@@ -1443,29 +1482,28 @@ mod tests {
         #[test]
         #[ignore]
         fn soundfont_renders_note_to_samples() {
-            let path = PathBuf::from(
-                config()
-                    .soundfont
-                    .expect("soundfont set in config"),
-            );
+            let path = PathBuf::from(config().soundfont.expect("soundfont set in config"));
             assert!(
                 path.exists(),
                 "SoundFont file should exist: {}",
                 path.display()
             );
-            let events = vec![
-                (0, true, 60, 100),
-                (500, false, 60, 0),
-            ];
+            let events = vec![(0, true, 60, 100), (500, false, 60, 0)];
             let samples = render_soundfont(&path, &events)
                 .expect("should render the SoundFont without error");
             // ~500ms at 48kHz stereo = ~48k samples; real note should be audible (non-silent)
-            assert!(samples.len() > 40_000, "samples should cover the note duration");
+            assert!(
+                samples.len() > 40_000,
+                "samples should cover the note duration"
+            );
             let energy = samples
                 .iter()
                 .map(|sample| sample.abs())
                 .fold(0.0_f64, |acc, sample| acc + sample as f64);
-            assert!(energy > 0.0, "a real note should produce nonzero audio energy");
+            assert!(
+                energy > 0.0,
+                "a real note should produce nonzero audio energy"
+            );
         }
     }
 }

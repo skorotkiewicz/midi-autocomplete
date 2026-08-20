@@ -113,3 +113,19 @@ uv run --extra gpu midilm dpo checkpoints/small.pt preferences.jsonl \
 ```
 
 Point the GTK app's model field at the resulting checkpoint. The app keeps one Python inference process alive, captures real MIDI input, and sends generated notes to the selected MIDI output.
+
+## Remote checkpoints
+
+The GUI model field and `--resume` also accept a Hugging Face resolve URL:
+
+```text
+https://huggingface.co/Grizzlykw/midilm/resolve/main/medium.resume.pt?download=true
+```
+
+`huggingface_hub` downloads it into its local cache on first use (and picks up the newest revision on later loads), so the app always continues from the latest uploaded checkpoint without manual file transfers. For inference prefer the lean `medium.pt` (weights only); `medium.resume.pt` additionally carries optimizer state and is meant for crash recovery:
+
+```sh
+uv run --extra gpu midilm train datasets \
+  --resume https://huggingface.co/Grizzlykw/midilm/resolve/main/medium.resume.pt?download=true \
+  --epochs 30
+```
