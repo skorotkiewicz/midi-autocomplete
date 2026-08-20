@@ -1146,6 +1146,7 @@ fn build_ui(app: &Application) {
     let timeline_for_timer = timeline.clone();
     let state_for_timer = shared.clone();
     let status_for_timer = status.clone();
+    let play_for_timer = play.clone();
     let stop_for_timer = stop.clone();
     let record_for_timer = record.clone();
     let playback_for_timer = playback_control.clone();
@@ -1185,7 +1186,9 @@ fn build_ui(app: &Application) {
         } else {
             "Rec"
         });
-        stop_for_timer.set_visible(playback_for_timer.is_playing());
+        let playing = playback_for_timer.is_playing();
+        play_for_timer.set_visible(!playing);
+        stop_for_timer.set_visible(playing);
         roll_for_timer.queue_draw();
         glib::ControlFlow::Continue
     });
@@ -1197,7 +1200,6 @@ fn build_ui(app: &Application) {
     devices.append(&output_dropdown);
     devices.append(&connect);
     devices.append(&refresh);
-    devices.append(&record);
 
     let controls = GtkBox::new(Orientation::Horizontal, 8);
     controls.append(&Label::new(Some("Model")));
@@ -1211,6 +1213,7 @@ fn build_ui(app: &Application) {
     playback.append(&Label::new(Some("SoundFont")));
     playback.append(&soundfont);
     playback.append(&browse);
+    playback.append(&record);
     playback.append(&play);
     playback.append(&stop);
 
