@@ -35,7 +35,53 @@ struct Note {
 struct Shared {
     notes: Vec<Note>,
     status: String,
+    connected: bool,
     capturing: bool,
+    capture_generation: u64,
+    capture_started_ms: u64,
+    capture_position_ms: u64,
+}
+
+impl Shared {
+    fn capture_position(&self, now_ms: u64) -> u64 {
+        self.capture_position_ms
+            + if self.capturing {
+                now_ms.saturating_sub(self.capture_started_ms)
+            } else {
+                0
+            }
+    }
+
+    fn toggle_capture(&mut self, now_ms: u64) -> bool {
+        if self.capturing {
+            self.capture_position_ms = self.capture_position(now_ms);
+            self.capturing = false;
+        } else {
+            self.capture_position_ms = self.capture_position_ms.max(
+                self.notes
+                    .iter()
+                    .map(|note| note.onset_ms + note.duration_ms)
+                    .max()
+                    .unwrap_or(0),
+            );
+            self.capture_started_ms = now_ms;
+            self.capturing = true;
+        }
+        self.capture_generation += 1;
+        self.status = if self.capturing {
+            "Recording MIDI prompt...".into()
+        } else {
+            "Recording stopped.".into()
+        };
+        self.capturing
+    }
+
+    fn clear_timeline(&mut self, now_ms: u64) {
+        self.notes.clear();
+        self.capture_position_ms = 0;
+        self.capture_started_ms = now_ms;
+        self.capture_generation += 1;
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
@@ -385,12 +431,27 @@ fn connect_input(
     let ports = input.ports();
     let port = ports.get(selected as usize).ok_or("Select a MIDI input")?;
     let mut capture = Capture::new();
+    let mut capture_generation = 0;
     input
         .connect(
             port,
             "midi-autocomplete-input",
             move |_, message, _| {
-                capture.receive(message, started.elapsed().as_millis() as u64, &shared)
+                let now = started.elapsed().as_millis() as u64;
+                let (position, generation) = {
+                    let state = shared.lock().unwrap();
+                    (
+                        state.capturing.then(|| state.capture_position(now)),
+                        state.capture_generation,
+                    )
+                };
+                if generation != capture_generation {
+                    capture = Capture::new();
+                    capture_generation = generation;
+                }
+                if let Some(position) = position {
+                    capture.receive(message, position, &shared);
+                }
             },
             (),
         )
@@ -754,6 +815,7 @@ fn build_ui(app: &Application) {
     let output_dropdown = dropdown(&output_names, initial_config.midi_output.as_deref());
     let connect = Button::with_label("Connect");
     let refresh = Button::with_label("Refresh");
+    let record = Button::with_label("Rec");
     let clear = Button::with_label("Clear");
     let generate = Button::with_label("Autocomplete");
     let play = Button::with_label("Play");
@@ -800,7 +862,7 @@ fn build_ui(app: &Application) {
         let playhead = if playback_for_draw.is_playing() {
             playback_for_draw.position(now)
         } else if state.capturing {
-            Some(now)
+            Some(state.capture_position(now))
         } else {
             None
         };
@@ -859,9 +921,11 @@ fn build_ui(app: &Application) {
                     config.clone()
                 };
                 let mut state = state_for_connect.lock().unwrap();
-                state.capturing = true;
+                state.connected = true;
+                state.capturing = false;
+                state.capture_generation += 1;
                 state.status = match save_config(&path_for_connect, &snapshot) {
-                    Ok(()) => "MIDI connected. Play a prompt.".into(),
+                    Ok(()) => "MIDI connected. Click Rec to capture a prompt.".into(),
                     Err(error) => error,
                 };
             }
@@ -884,7 +948,9 @@ fn build_ui(app: &Application) {
         refresh_dropdown(&input_select, &inputs, preferred_input.as_deref());
         refresh_dropdown(&output_select, &outputs, preferred_output.as_deref());
         let mut state = state_for_refresh.lock().unwrap();
+        state.connected = false;
         state.capturing = false;
+        state.capture_generation += 1;
         state.status = format!(
             "Found {} inputs and {} outputs. Click Connect.",
             inputs.len(),
@@ -910,15 +976,32 @@ fn build_ui(app: &Application) {
         ) {
             Ok(()) => {
                 let mut state = shared.lock().unwrap();
-                state.capturing = true;
-                state.status = "MIDI auto-connected.".into();
+                state.connected = true;
+                state.capturing = false;
+                state.capture_generation += 1;
+                state.status = "MIDI auto-connected. Click Rec to capture a prompt.".into();
             }
             Err(error) => shared.lock().unwrap().status = format!("Auto-connect failed: {error}"),
         }
     }
 
+    let state_for_record = shared.clone();
+    record.connect_clicked(move |_| {
+        let mut state = state_for_record.lock().unwrap();
+        if state.connected {
+            state.toggle_capture(started.elapsed().as_millis() as u64);
+        } else {
+            state.status = "Connect MIDI devices before recording.".into();
+        }
+    });
+
     let state_for_clear = shared.clone();
-    clear.connect_clicked(move |_| state_for_clear.lock().unwrap().notes.clear());
+    clear.connect_clicked(move |_| {
+        state_for_clear
+            .lock()
+            .unwrap()
+            .clear_timeline(started.elapsed().as_millis() as u64)
+    });
 
     let soundfont_for_browse = soundfont.clone();
     let config_for_browse = config.clone();
@@ -1064,6 +1147,7 @@ fn build_ui(app: &Application) {
     let state_for_timer = shared.clone();
     let status_for_timer = status.clone();
     let stop_for_timer = stop.clone();
+    let record_for_timer = record.clone();
     let playback_for_timer = playback_control.clone();
     glib::timeout_add_local(Duration::from_millis(33), move || {
         let now = started.elapsed().as_millis() as u64;
@@ -1071,11 +1155,13 @@ fn build_ui(app: &Application) {
         let playhead = if playback_for_timer.is_playing() {
             playback_for_timer.position(now)
         } else if state.capturing {
-            Some(now)
+            Some(state.capture_position(now))
         } else {
             None
         };
-        let bounds = timeline_bounds(&state.notes, playhead);
+        let timeline_position =
+            playhead.or_else(|| state.connected.then(|| state.capture_position(now)));
+        let bounds = timeline_bounds(&state.notes, timeline_position);
         status_for_timer.set_text(&format!("{}  |  {} notes", state.status, state.notes.len()));
         drop(state);
 
@@ -1094,6 +1180,11 @@ fn build_ui(app: &Application) {
                 adjustment.set_value(x.max(0.0));
             }
         }
+        record_for_timer.set_label(if state_for_timer.lock().unwrap().capturing {
+            "Stop Rec"
+        } else {
+            "Rec"
+        });
         stop_for_timer.set_visible(playback_for_timer.is_playing());
         roll_for_timer.queue_draw();
         glib::ControlFlow::Continue
@@ -1106,6 +1197,7 @@ fn build_ui(app: &Application) {
     devices.append(&output_dropdown);
     devices.append(&connect);
     devices.append(&refresh);
+    devices.append(&record);
 
     let controls = GtkBox::new(Orientation::Horizontal, 8);
     controls.append(&Label::new(Some("Model")));
@@ -1198,6 +1290,18 @@ mod tests {
             generated: false,
         }];
         assert_eq!(timeline_bounds(&notes, Some(1_000)), Some((500, 1_000)));
+    }
+
+    #[test]
+    fn recording_resumes_from_its_frozen_position() {
+        let mut state = Shared::default();
+        assert!(state.toggle_capture(100));
+        assert_eq!(state.capture_position(250), 150);
+        assert!(!state.toggle_capture(250));
+        assert_eq!(state.capture_position(5_000), 150);
+        assert!(state.toggle_capture(5_000));
+        assert_eq!(state.capture_position(5_100), 250);
+        assert_eq!(state.capture_generation, 3);
     }
 
     #[test]
