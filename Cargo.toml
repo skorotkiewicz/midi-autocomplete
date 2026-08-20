@@ -5,3 +5,4 @@ edition = "2024"
 
 [dependencies]
 gtk4 = "0.11.4"
+midir = "0.10.3"

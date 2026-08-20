@@ -1,1 +1,5 @@
 /target
+/midilm/.venv
+/midilm/checkpoints
+__pycache__/
+*.pyc
