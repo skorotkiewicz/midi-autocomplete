@@ -295,14 +295,19 @@ struct ModelProcess {
 
 impl ModelProcess {
     fn start(checkpoint: &Path) -> Result<Self, String> {
-        let checkpoint = checkpoint
-            .canonicalize()
-            .map_err(|error| format!("Model not found: {error}"))?;
+        let root = repo_root();
+        let checkpoint = if checkpoint.is_absolute() {
+            checkpoint.to_path_buf()
+        } else {
+            root.join(checkpoint)
+        }
+        .canonicalize()
+        .map_err(|error| format!("Model not found: {error}"))?;
         let mut child = Command::new("uv")
             .args([
                 "run",
                 "--directory",
-                "midilm",
+                &root.join("midilm").to_string_lossy(),
                 "--extra",
                 "cpu",
                 "midilm",
@@ -385,6 +390,22 @@ fn midi_outputs() -> Vec<String> {
         .iter()
         .filter_map(|port| output.port_name(port).ok())
         .collect()
+}
+
+/// Absolute path to the repo root, so `uv --directory midilm` and model paths
+/// work no matter what directory the process was launched from.
+fn repo_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+}
+
+/// Send all-notes-off + reset to the connected output so notes don't hang when
+/// the connection is dropped (connect/refresh swaps). Bluetooth MIDI in
+/// particular can leave tails if a session closes during a held note.
+fn silence_output(output: &Arc<Mutex<Option<MidiOutputConnection>>>) {
+    if let Some(connection) = output.lock().unwrap().as_mut() {
+        let _ = connection.send(&[0xb0, 120, 0]);
+        let _ = connection.send(&[0xb0, 123, 0]);
+    }
 }
 
 fn preferred_index(names: &[String], preferred: Option<&str>) -> Option<u32> {
@@ -477,6 +498,7 @@ fn connect_devices(
 ) -> Result<(), String> {
     let input = connect_input(input_index, started, shared)?;
     let output = connect_output(output_index)?;
+    silence_output(output_slot);
     *input_slot.borrow_mut() = Some(input);
     *output_slot.lock().unwrap() = Some(output);
     Ok(())
@@ -941,6 +963,7 @@ fn build_ui(app: &Application) {
     refresh.connect_clicked(move |_| {
         let preferred_input = selected_name(&input_select);
         let preferred_output = selected_name(&output_select);
+        silence_output(&output_for_refresh);
         *input_for_refresh.borrow_mut() = None;
         *output_for_refresh.lock().unwrap() = None;
         let inputs = midi_inputs();
