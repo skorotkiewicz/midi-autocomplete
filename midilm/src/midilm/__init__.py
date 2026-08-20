@@ -13,6 +13,7 @@ from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
 from .midi import read_midi
+from .prepare import prepare_dataset
 from .model import (
     DELTAS,
     DURATIONS,
@@ -62,7 +63,9 @@ def augment(notes: list[list[int]]) -> list[list[int]]:
 
 class MidiDataset(Dataset[Tensor]):
     def __init__(self, root: Path, context: int) -> None:
-        self.paths = sorted((*root.rglob("*.mid"), *root.rglob("*.midi")))
+        self.paths = sorted(
+            path for path in root.rglob("*") if path.is_file() and path.suffix.lower() in (".mid", ".midi")
+        )
         if not self.paths:
             raise ValueError(f"no .mid or .midi files under {root}")
         self.context = context
@@ -205,6 +208,11 @@ def main() -> None:
     parser = argparse.ArgumentParser(prog="midilm")
     commands = parser.add_subparsers(dest="command", required=True)
 
+    download = commands.add_parser("prepare", help="download MIDI files from a Hugging Face dataset")
+    download.add_argument("repository", help="dataset repository, for example owner/name")
+    download.add_argument("output", type=Path)
+    download.add_argument("--revision")
+
     init = commands.add_parser("init", help="create an untrained checkpoint")
     init.add_argument("--size", choices=("tiny", "small", "medium", "large"), default="small")
     init.add_argument("--output", type=Path, default=Path("checkpoints/small.pt"))
@@ -235,7 +243,10 @@ def main() -> None:
 
     commands.add_parser("self-test")
     args = parser.parse_args()
-    if args.command == "init":
+    if args.command == "prepare":
+        count = prepare_dataset(args.repository, args.output, args.revision)
+        print(f"prepared {count:,} MIDI files under {args.output}")
+    elif args.command == "init":
         model = MidiLM(ModelConfig.preset(args.size))
         save_checkpoint(args.output, model)
         print(f"saved {sum(parameter.numel() for parameter in model.parameters()):,} parameters to {args.output}")

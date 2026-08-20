@@ -18,9 +18,19 @@ uv sync --extra cpu             # or: uv sync --extra gpu
 uv run --extra cpu midilm self-test
 ```
 
+## Prepare a Hugging Face dataset
+
+For repositories containing raw `.mid`, `.midi`, or ZIP files:
+
+```sh
+uv run --extra cpu midilm prepare owner/dataset datasets/my-dataset
+```
+
+The command downloads only MIDI and ZIP files, safely extracts MIDI files from ZIP archives, and reports the number found. Run `hf auth login` first for private or gated datasets. Parquet/Arrow datasets need a small adapter for their specific column schema.
+
 ## Train
 
-Pass a directory containing piano `.mid` or `.midi` files:
+Pass the prepared directory, or any directory containing piano `.mid` or `.midi` files:
 
 ```sh
 uv run --extra gpu midilm train /path/to/midi \
