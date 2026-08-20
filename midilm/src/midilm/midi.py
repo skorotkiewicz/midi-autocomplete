@@ -30,9 +30,9 @@ def read_midi(path: Path) -> list[list[int]]:
 
     for message in mido.merge_tracks(midi.tracks):
         tick += message.time
-        if message.is_meta or getattr(message, "channel", -1) == 9:
+        channel = getattr(message, "channel", None)
+        if message.is_meta or channel is None or channel == 9:
             continue
-        channel = message.channel
         if message.type == "control_change" and message.control == 64:
             was_down = sustain[channel]
             sustain[channel] = message.value >= 64

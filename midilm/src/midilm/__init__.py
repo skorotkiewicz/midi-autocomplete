@@ -7,6 +7,7 @@ import sys
 from pathlib import Path
 
 import torch
+from mido.midifiles.meta import KeySignatureError
 from torch import Tensor
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
@@ -74,7 +75,14 @@ class MidiDataset(Dataset[Tensor]):
         return len(self.paths)
 
     def __getitem__(self, index: int) -> Tensor:
-        notes = augment(read_midi(self.paths[index]))
+        for offset in range(len(self.paths)):
+            try:
+                notes = augment(read_midi(self.paths[(index + offset) % len(self.paths)]))
+                break
+            except (EOFError, OSError, ValueError, KeySignatureError):
+                continue
+        else:
+            raise RuntimeError("dataset contains no readable MIDI files")
         if len(notes) >= self.context - 1:
             start = random.randrange(len(notes) - self.context + 2)
             sequence = notes[start : start + self.context - 1]
