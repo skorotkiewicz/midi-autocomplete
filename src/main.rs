@@ -9,8 +9,9 @@ use gtk4::{
 use midir::{Ignore, MidiInput, MidiInputConnection, MidiOutput, MidiOutputConnection};
 use rodio::{DeviceSinkBuilder, Player, buffer::SamplesBuffer};
 use rustysynth::{SoundFont, Synthesizer, SynthesizerSettings};
+use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
-use std::fs::File;
+use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Write};
 use std::num::{NonZeroU16, NonZeroU32};
 use std::path::{Path, PathBuf};
@@ -34,6 +35,45 @@ struct Note {
 struct Shared {
     notes: Vec<Note>,
     status: String,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+#[serde(default)]
+struct AppConfig {
+    midi_input: Option<String>,
+    midi_output: Option<String>,
+    soundfont: Option<String>,
+}
+
+fn config_path() -> PathBuf {
+    if let Some(path) = std::env::var_os("XDG_CONFIG_HOME").filter(|path| !path.is_empty()) {
+        return PathBuf::from(path).join("midi-autocomplete/config.toml");
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        return PathBuf::from(home).join(".config/midi-autocomplete/config.toml");
+    }
+    PathBuf::from("config.toml")
+}
+
+fn load_config(path: &Path) -> Result<AppConfig, String> {
+    match fs::read_to_string(path) {
+        Ok(contents) => {
+            toml::from_str(&contents).map_err(|error| format!("Invalid config: {error}"))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(AppConfig::default()),
+        Err(error) => Err(format!("Could not read config: {error}")),
+    }
+}
+
+fn save_config(path: &Path, config: &AppConfig) -> Result<(), String> {
+    let contents = toml::to_string_pretty(config).map_err(|error| error.to_string())?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("Could not create config directory: {error}"))?;
+    }
+    let temporary = path.with_extension("toml.tmp");
+    fs::write(&temporary, contents).map_err(|error| format!("Could not write config: {error}"))?;
+    fs::rename(&temporary, path).map_err(|error| format!("Could not save config: {error}"))
 }
 
 #[derive(Default)]
@@ -266,9 +306,38 @@ fn midi_outputs() -> Vec<String> {
         .collect()
 }
 
-fn dropdown(names: &[String]) -> DropDown {
+fn preferred_index(names: &[String], preferred: Option<&str>) -> Option<u32> {
+    preferred.and_then(|name| {
+        names
+            .iter()
+            .position(|candidate| candidate == name)
+            .map(|index| index as u32)
+    })
+}
+
+fn dropdown(names: &[String], preferred: Option<&str>) -> DropDown {
     let labels: Vec<&str> = names.iter().map(String::as_str).collect();
-    DropDown::from_strings(&labels)
+    let dropdown = DropDown::from_strings(&labels);
+    if let Some(index) = preferred_index(names, preferred) {
+        dropdown.set_selected(index);
+    }
+    dropdown
+}
+
+fn selected_name(dropdown: &DropDown) -> Option<String> {
+    dropdown
+        .selected_item()?
+        .downcast::<gtk4::StringObject>()
+        .ok()
+        .map(|item| item.string().to_string())
+}
+
+fn refresh_dropdown(dropdown: &DropDown, names: &[String], preferred: Option<&str>) {
+    let labels: Vec<&str> = names.iter().map(String::as_str).collect();
+    dropdown.set_model(Some(&gtk4::StringList::new(&labels)));
+    if let Some(index) = preferred_index(names, preferred) {
+        dropdown.set_selected(index);
+    }
 }
 
 fn connect_input(
@@ -300,6 +369,21 @@ fn connect_output(selected: u32) -> Result<MidiOutputConnection, String> {
     output
         .connect(port, "midi-autocomplete-output")
         .map_err(|error| error.to_string())
+}
+
+fn connect_devices(
+    input_index: u32,
+    output_index: u32,
+    started: Instant,
+    shared: Arc<Mutex<Shared>>,
+    input_slot: &Rc<RefCell<Option<MidiInputConnection<()>>>>,
+    output_slot: &Arc<Mutex<Option<MidiOutputConnection>>>,
+) -> Result<(), String> {
+    let input = connect_input(input_index, started, shared)?;
+    let output = connect_output(output_index)?;
+    *input_slot.borrow_mut() = Some(input);
+    *output_slot.lock().unwrap() = Some(output);
+    Ok(())
 }
 
 fn prompt(notes: &[Note], bpm: f64) -> String {
@@ -590,8 +674,13 @@ fn draw_roll(cr: &cairo::Context, width: i32, height: i32, notes: &[Note]) {
 
 fn build_ui(app: &Application) {
     let started = Instant::now();
+    let config_path = config_path();
+    let (initial_config, initial_status) = match load_config(&config_path) {
+        Ok(config) => (config, "Connect MIDI devices".to_string()),
+        Err(error) => (AppConfig::default(), error),
+    };
     let shared = Arc::new(Mutex::new(Shared {
-        status: "Connect MIDI devices".into(),
+        status: initial_status,
         ..Default::default()
     }));
     let output: Arc<Mutex<Option<MidiOutputConnection>>> = Arc::new(Mutex::new(None));
@@ -600,10 +689,10 @@ fn build_ui(app: &Application) {
         Rc::new(RefCell::new(None));
     let input_names = midi_inputs();
     let output_names = midi_outputs();
-    let has_midi_output = !output_names.is_empty();
-    let input_dropdown = dropdown(&input_names);
-    let output_dropdown = dropdown(&output_names);
+    let input_dropdown = dropdown(&input_names, initial_config.midi_input.as_deref());
+    let output_dropdown = dropdown(&output_names, initial_config.midi_output.as_deref());
     let connect = Button::with_label("Connect");
+    let refresh = Button::with_label("Refresh");
     let clear = Button::with_label("Clear");
     let generate = Button::with_label("Autocomplete");
     let play = Button::with_label("Play");
@@ -614,6 +703,10 @@ fn build_ui(app: &Application) {
         .placeholder_text("Select a .sf2 SoundFont")
         .hexpand(true)
         .build();
+    if let Some(path) = &initial_config.soundfont {
+        soundfont.set_text(path);
+    }
+    let config = Arc::new(Mutex::new(initial_config));
     let model = Entry::builder()
         .text("midilm/checkpoints/small.pt")
         .hexpand(true)
@@ -636,38 +729,116 @@ fn build_ui(app: &Application) {
         draw_roll(cr, width, height, &state_for_draw.lock().unwrap().notes)
     });
 
+    let config_for_input = config.clone();
+    let path_for_input = config_path.clone();
+    let state_for_input = shared.clone();
+    input_dropdown.connect_selected_notify(move |dropdown| {
+        let snapshot = {
+            let mut config = config_for_input.lock().unwrap();
+            config.midi_input = selected_name(dropdown);
+            config.clone()
+        };
+        if let Err(error) = save_config(&path_for_input, &snapshot) {
+            state_for_input.lock().unwrap().status = error;
+        }
+    });
+
+    let config_for_output = config.clone();
+    let path_for_output = config_path.clone();
+    let state_for_output = shared.clone();
+    output_dropdown.connect_selected_notify(move |dropdown| {
+        let snapshot = {
+            let mut config = config_for_output.lock().unwrap();
+            config.midi_output = selected_name(dropdown);
+            config.clone()
+        };
+        if let Err(error) = save_config(&path_for_output, &snapshot) {
+            state_for_output.lock().unwrap().status = error;
+        }
+    });
+
     let input_for_connect = input_connection.clone();
     let output_for_connect = output.clone();
     let state_for_connect = shared.clone();
+    let config_for_connect = config.clone();
+    let path_for_connect = config_path.clone();
     let input_select = input_dropdown.clone();
     let output_select = output_dropdown.clone();
     connect.connect_clicked(move |_| {
-        match connect_input(input_select.selected(), started, state_for_connect.clone()) {
-            Ok(connection) => *input_for_connect.borrow_mut() = Some(connection),
-            Err(error) => {
-                state_for_connect.lock().unwrap().status = error;
-                return;
+        match connect_devices(
+            input_select.selected(),
+            output_select.selected(),
+            started,
+            state_for_connect.clone(),
+            &input_for_connect,
+            &output_for_connect,
+        ) {
+            Ok(()) => {
+                let snapshot = {
+                    let mut config = config_for_connect.lock().unwrap();
+                    config.midi_input = selected_name(&input_select);
+                    config.midi_output = selected_name(&output_select);
+                    config.clone()
+                };
+                state_for_connect.lock().unwrap().status =
+                    match save_config(&path_for_connect, &snapshot) {
+                        Ok(()) => "MIDI connected. Play a prompt.".into(),
+                        Err(error) => error,
+                    };
             }
-        }
-        if has_midi_output {
-            match connect_output(output_select.selected()) {
-                Ok(connection) => {
-                    *output_for_connect.lock().unwrap() = Some(connection);
-                    state_for_connect.lock().unwrap().status =
-                        "MIDI connected. Play a prompt.".into();
-                }
-                Err(error) => state_for_connect.lock().unwrap().status = error,
-            }
-        } else {
-            state_for_connect.lock().unwrap().status =
-                "MIDI input connected. SoundFont playback only.".into();
+            Err(error) => state_for_connect.lock().unwrap().status = error,
         }
     });
+
+    let input_for_refresh = input_connection.clone();
+    let output_for_refresh = output.clone();
+    let state_for_refresh = shared.clone();
+    let input_select = input_dropdown.clone();
+    let output_select = output_dropdown.clone();
+    refresh.connect_clicked(move |_| {
+        let preferred_input = selected_name(&input_select);
+        let preferred_output = selected_name(&output_select);
+        *input_for_refresh.borrow_mut() = None;
+        *output_for_refresh.lock().unwrap() = None;
+        let inputs = midi_inputs();
+        let outputs = midi_outputs();
+        refresh_dropdown(&input_select, &inputs, preferred_input.as_deref());
+        refresh_dropdown(&output_select, &outputs, preferred_output.as_deref());
+        state_for_refresh.lock().unwrap().status = format!(
+            "Found {} inputs and {} outputs. Click Connect.",
+            inputs.len(),
+            outputs.len()
+        );
+    });
+
+    let auto_connect = {
+        let config = config.lock().unwrap();
+        config.midi_input.as_ref() == selected_name(&input_dropdown).as_ref()
+            && config.midi_output.as_ref() == selected_name(&output_dropdown).as_ref()
+            && config.midi_input.is_some()
+            && config.midi_output.is_some()
+    };
+    if auto_connect {
+        match connect_devices(
+            input_dropdown.selected(),
+            output_dropdown.selected(),
+            started,
+            shared.clone(),
+            &input_connection,
+            &output,
+        ) {
+            Ok(()) => shared.lock().unwrap().status = "MIDI auto-connected.".into(),
+            Err(error) => shared.lock().unwrap().status = format!("Auto-connect failed: {error}"),
+        }
+    }
 
     let state_for_clear = shared.clone();
     clear.connect_clicked(move |_| state_for_clear.lock().unwrap().notes.clear());
 
     let soundfont_for_browse = soundfont.clone();
+    let config_for_browse = config.clone();
+    let path_for_browse = config_path.clone();
+    let state_for_browse = shared.clone();
     browse.connect_clicked(move |_| {
         let chooser = FileChooserNative::builder()
             .title("Choose a SoundFont")
@@ -680,11 +851,23 @@ fn build_ui(app: &Application) {
         filter.add_pattern("*.SF2");
         chooser.set_filter(&filter);
         let entry = soundfont_for_browse.clone();
+        let config = config_for_browse.clone();
+        let config_path = path_for_browse.clone();
+        let state = state_for_browse.clone();
         chooser.connect_response(move |chooser, response| {
             if response == ResponseType::Accept
                 && let Some(path) = chooser.file().and_then(|file| file.path())
             {
-                entry.set_text(&path.to_string_lossy());
+                let path = path.to_string_lossy().into_owned();
+                entry.set_text(&path);
+                let snapshot = {
+                    let mut config = config.lock().unwrap();
+                    config.soundfont = Some(path);
+                    config.clone()
+                };
+                if let Err(error) = save_config(&config_path, &snapshot) {
+                    state.lock().unwrap().status = error;
+                }
             }
         });
         chooser.show();
@@ -694,10 +877,21 @@ fn build_ui(app: &Application) {
     let output_for_play = output.clone();
     let playback_for_play = playback_control.clone();
     let soundfont_for_play = soundfont.clone();
+    let config_for_play = config.clone();
+    let path_for_play = config_path.clone();
     play.connect_clicked(move |_| {
         let path = PathBuf::from(soundfont_for_play.text().as_str());
         if path.as_os_str().is_empty() {
             state_for_play.lock().unwrap().status = "Choose a .sf2 SoundFont first".into();
+            return;
+        }
+        let snapshot = {
+            let mut config = config_for_play.lock().unwrap();
+            config.soundfont = Some(path.to_string_lossy().into_owned());
+            config.clone()
+        };
+        if let Err(error) = save_config(&path_for_play, &snapshot) {
+            state_for_play.lock().unwrap().status = error;
             return;
         }
         let notes = state_for_play.lock().unwrap().notes.clone();
@@ -800,6 +994,7 @@ fn build_ui(app: &Application) {
     devices.append(&Label::new(Some("Output")));
     devices.append(&output_dropdown);
     devices.append(&connect);
+    devices.append(&refresh);
 
     let controls = GtkBox::new(Orientation::Horizontal, 8);
     controls.append(&Label::new(Some("Model")));
@@ -848,6 +1043,28 @@ fn main() -> glib::ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn config_round_trips() {
+        let directory =
+            std::env::temp_dir().join(format!("midi-autocomplete-{}", std::process::id()));
+        let path = directory.join("config.toml");
+        let expected = AppConfig {
+            midi_input: Some("Piano In".into()),
+            midi_output: Some("Piano Out".into()),
+            soundfont: Some("/sounds/piano.sf2".into()),
+        };
+        save_config(&path, &expected).unwrap();
+        assert_eq!(load_config(&path).unwrap(), expected);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn device_selection_follows_names_after_refresh() {
+        let names = vec!["Other".to_string(), "Piano".to_string()];
+        assert_eq!(preferred_index(&names, Some("Piano")), Some(1));
+        assert_eq!(preferred_index(&names, Some("Missing")), None);
+    }
 
     #[test]
     fn replay_normalizes_the_musical_timeline() {
