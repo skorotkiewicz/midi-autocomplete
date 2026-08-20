@@ -3,8 +3,8 @@ use gtk4::glib;
 use gtk4::prelude::*;
 use gtk4::{
     Adjustment, Application, ApplicationWindow, Box as GtkBox, Button, DrawingArea, DropDown,
-    Entry, FileChooserAction, FileChooserNative, FileFilter, Label, Orientation, ResponseType,
-    SpinButton,
+    Entry, FileChooserAction, FileChooserNative, FileFilter, Label, Orientation, PolicyType,
+    ResponseType, ScrolledWindow, SpinButton,
 };
 use midir::{Ignore, MidiInput, MidiInputConnection, MidiOutput, MidiOutputConnection};
 use rodio::{DeviceSinkBuilder, Player, buffer::SamplesBuffer};
@@ -35,6 +35,7 @@ struct Note {
 struct Shared {
     notes: Vec<Note>,
     status: String,
+    capturing: bool,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
@@ -80,11 +81,16 @@ fn save_config(path: &Path, config: &AppConfig) -> Result<(), String> {
 struct PlaybackControl {
     generation: AtomicU64,
     playing: AtomicBool,
+    has_timeline: AtomicBool,
+    wall_start_ms: AtomicU64,
+    musical_start_ms: AtomicU64,
+    musical_end_ms: AtomicU64,
     player: Mutex<Option<Arc<Player>>>,
 }
 
 impl PlaybackControl {
     fn begin(&self) -> u64 {
+        self.has_timeline.store(false, Ordering::SeqCst);
         self.playing.store(true, Ordering::SeqCst);
         let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
         if let Some(player) = self.player.lock().unwrap().take() {
@@ -94,6 +100,7 @@ impl PlaybackControl {
     }
 
     fn stop(&self) {
+        self.has_timeline.store(false, Ordering::SeqCst);
         self.playing.store(false, Ordering::SeqCst);
         self.generation.fetch_add(1, Ordering::SeqCst);
         if let Some(player) = self.player.lock().unwrap().take() {
@@ -109,6 +116,33 @@ impl PlaybackControl {
         self.playing.load(Ordering::SeqCst)
     }
 
+    fn set_timeline(
+        &self,
+        generation: u64,
+        wall_start_ms: u64,
+        musical_start_ms: u64,
+        musical_end_ms: u64,
+    ) {
+        if self.is_active(generation) {
+            self.wall_start_ms.store(wall_start_ms, Ordering::SeqCst);
+            self.musical_start_ms
+                .store(musical_start_ms, Ordering::SeqCst);
+            self.musical_end_ms.store(musical_end_ms, Ordering::SeqCst);
+            self.has_timeline.store(true, Ordering::SeqCst);
+        }
+    }
+
+    fn position(&self, now_ms: u64) -> Option<u64> {
+        if !self.is_playing() || !self.has_timeline.load(Ordering::SeqCst) {
+            return None;
+        }
+        Some(
+            (self.musical_start_ms.load(Ordering::SeqCst)
+                + now_ms.saturating_sub(self.wall_start_ms.load(Ordering::SeqCst)))
+            .min(self.musical_end_ms.load(Ordering::SeqCst)),
+        )
+    }
+
     fn set_player(&self, generation: u64, player: Arc<Player>) {
         let mut current = self.player.lock().unwrap();
         if self.is_active(generation) {
@@ -121,6 +155,7 @@ impl PlaybackControl {
     fn finish(&self, generation: u64) {
         let mut current = self.player.lock().unwrap();
         if self.is_active(generation) {
+            self.has_timeline.store(false, Ordering::SeqCst);
             self.playing.store(false, Ordering::SeqCst);
             current.take();
         }
@@ -416,6 +451,7 @@ type MidiEvent = (u64, bool, u8, u8);
 
 const SAMPLE_RATE: u32 = 48_000;
 const MAX_PLAYBACK_MS: u64 = 5 * 60 * 1_000;
+const PIXELS_PER_MS: f64 = 0.08;
 
 fn send_midi_events(
     events: Vec<MidiEvent>,
@@ -556,6 +592,13 @@ fn replay(
             return;
         }
         let base = started.elapsed().as_millis() as u64;
+        let first = notes.iter().map(|note| note.onset_ms).min().unwrap();
+        let end = notes
+            .iter()
+            .map(|note| note.onset_ms + note.duration_ms)
+            .max()
+            .unwrap();
+        playback.set_timeline(generation, base + 100, first, end);
         let midi_events = events
             .into_iter()
             .map(|(time, on, pitch, velocity)| (base + time, on, pitch, velocity))
@@ -618,6 +661,16 @@ fn play_generated(
             generated: true,
         });
     }
+    let Some(end) = notes
+        .iter()
+        .map(|note| note.onset_ms + note.duration_ms)
+        .max()
+    else {
+        shared.lock().unwrap().status = "Model generated no notes".into();
+        playback.finish(generation);
+        return;
+    };
+    playback.set_timeline(generation, live_base, musical_base, end);
     let mut events = Vec::with_capacity(notes.len() * 2);
     for note in &notes {
         let live_onset = live_base + note.onset_ms.saturating_sub(musical_base);
@@ -639,16 +692,21 @@ fn play_generated(
     });
 }
 
-fn draw_roll(cr: &cairo::Context, width: i32, height: i32, notes: &[Note]) {
-    cr.set_source_rgb(0.07, 0.08, 0.10);
-    let _ = cr.paint();
+fn timeline_bounds(notes: &[Note], playhead: Option<u64>) -> Option<(u64, u64)> {
+    let start = notes.iter().map(|note| note.onset_ms).min().or(playhead)?;
     let end = notes
         .iter()
         .map(|note| note.onset_ms + note.duration_ms)
+        .chain(playhead)
         .max()
-        .unwrap_or(15_000)
-        .max(15_000);
-    let start = end.saturating_sub(15_000);
+        .unwrap_or(start);
+    Some((start, end))
+}
+
+fn draw_roll(cr: &cairo::Context, width: i32, height: i32, notes: &[Note], playhead: Option<u64>) {
+    cr.set_source_rgb(0.07, 0.08, 0.10);
+    let _ = cr.paint();
+    let start = timeline_bounds(notes, playhead).map_or(0, |bounds| bounds.0);
     for pitch in 21..=108 {
         let y = height as f64 * (108 - pitch) as f64 / 88.0;
         cr.set_source_rgba(1.0, 1.0, 1.0, if pitch % 12 == 0 { 0.10 } else { 0.025 });
@@ -656,11 +714,8 @@ fn draw_roll(cr: &cairo::Context, width: i32, height: i32, notes: &[Note]) {
         let _ = cr.fill();
     }
     for note in notes {
-        if note.onset_ms + note.duration_ms < start {
-            continue;
-        }
-        let x = (note.onset_ms.saturating_sub(start) as f64 / 15_000.0) * width as f64;
-        let w = (note.duration_ms as f64 / 15_000.0 * width as f64).max(2.0);
+        let x = note.onset_ms.saturating_sub(start) as f64 * PIXELS_PER_MS;
+        let w = (note.duration_ms as f64 * PIXELS_PER_MS).max(2.0);
         let y = height as f64 * (108_i32 - note.pitch as i32) as f64 / 88.0;
         if note.generated {
             cr.set_source_rgb(0.25, 0.80, 0.48);
@@ -668,6 +723,12 @@ fn draw_roll(cr: &cairo::Context, width: i32, height: i32, notes: &[Note]) {
             cr.set_source_rgb(0.32, 0.58, 0.95);
         }
         cr.rectangle(x, y, w, (height as f64 / 88.0).max(3.0));
+        let _ = cr.fill();
+    }
+    if let Some(playhead) = playhead {
+        let x = playhead.saturating_sub(start) as f64 * PIXELS_PER_MS;
+        cr.set_source_rgb(0.95, 0.18, 0.20);
+        cr.rectangle(x, 0.0, 2.0, height as f64);
         let _ = cr.fill();
     }
 }
@@ -720,13 +781,30 @@ fn build_ui(app: &Application) {
     status.set_xalign(0.0);
     let roll = DrawingArea::builder()
         .content_height(420)
+        .content_width(1_000)
         .hexpand(true)
         .vexpand(true)
         .build();
+    let timeline = ScrolledWindow::builder()
+        .hscrollbar_policy(PolicyType::Automatic)
+        .vscrollbar_policy(PolicyType::Never)
+        .vexpand(true)
+        .child(&roll)
+        .build();
 
     let state_for_draw = shared.clone();
+    let playback_for_draw = playback_control.clone();
     roll.set_draw_func(move |_, cr, width, height| {
-        draw_roll(cr, width, height, &state_for_draw.lock().unwrap().notes)
+        let now = started.elapsed().as_millis() as u64;
+        let state = state_for_draw.lock().unwrap();
+        let playhead = if playback_for_draw.is_playing() {
+            playback_for_draw.position(now)
+        } else if state.capturing {
+            Some(now)
+        } else {
+            None
+        };
+        draw_roll(cr, width, height, &state.notes, playhead);
     });
 
     let config_for_input = config.clone();
@@ -780,11 +858,12 @@ fn build_ui(app: &Application) {
                     config.midi_output = selected_name(&output_select);
                     config.clone()
                 };
-                state_for_connect.lock().unwrap().status =
-                    match save_config(&path_for_connect, &snapshot) {
-                        Ok(()) => "MIDI connected. Play a prompt.".into(),
-                        Err(error) => error,
-                    };
+                let mut state = state_for_connect.lock().unwrap();
+                state.capturing = true;
+                state.status = match save_config(&path_for_connect, &snapshot) {
+                    Ok(()) => "MIDI connected. Play a prompt.".into(),
+                    Err(error) => error,
+                };
             }
             Err(error) => state_for_connect.lock().unwrap().status = error,
         }
@@ -804,7 +883,9 @@ fn build_ui(app: &Application) {
         let outputs = midi_outputs();
         refresh_dropdown(&input_select, &inputs, preferred_input.as_deref());
         refresh_dropdown(&output_select, &outputs, preferred_output.as_deref());
-        state_for_refresh.lock().unwrap().status = format!(
+        let mut state = state_for_refresh.lock().unwrap();
+        state.capturing = false;
+        state.status = format!(
             "Found {} inputs and {} outputs. Click Connect.",
             inputs.len(),
             outputs.len()
@@ -827,7 +908,11 @@ fn build_ui(app: &Application) {
             &input_connection,
             &output,
         ) {
-            Ok(()) => shared.lock().unwrap().status = "MIDI auto-connected.".into(),
+            Ok(()) => {
+                let mut state = shared.lock().unwrap();
+                state.capturing = true;
+                state.status = "MIDI auto-connected.".into();
+            }
             Err(error) => shared.lock().unwrap().status = format!("Auto-connect failed: {error}"),
         }
     }
@@ -975,14 +1060,40 @@ fn build_ui(app: &Application) {
     });
 
     let roll_for_timer = roll.clone();
+    let timeline_for_timer = timeline.clone();
     let state_for_timer = shared.clone();
     let status_for_timer = status.clone();
     let stop_for_timer = stop.clone();
     let playback_for_timer = playback_control.clone();
     glib::timeout_add_local(Duration::from_millis(33), move || {
+        let now = started.elapsed().as_millis() as u64;
         let state = state_for_timer.lock().unwrap();
+        let playhead = if playback_for_timer.is_playing() {
+            playback_for_timer.position(now)
+        } else if state.capturing {
+            Some(now)
+        } else {
+            None
+        };
+        let bounds = timeline_bounds(&state.notes, playhead);
         status_for_timer.set_text(&format!("{}  |  {} notes", state.status, state.notes.len()));
         drop(state);
+
+        let viewport = timeline_for_timer.width().max(1);
+        let content_width = bounds.map_or(viewport, |(start, end)| {
+            ((end.saturating_sub(start) + 1_000) as f64 * PIXELS_PER_MS) as i32
+        });
+        roll_for_timer.set_content_width(content_width.max(viewport));
+        if let (Some(playhead), Some((start, _))) = (playhead, bounds) {
+            let x = playhead.saturating_sub(start) as f64 * PIXELS_PER_MS;
+            let adjustment = timeline_for_timer.hadjustment();
+            let page = viewport as f64;
+            if x > adjustment.value() + page - 40.0 {
+                adjustment.set_value((x - page + 40.0).max(0.0));
+            } else if x < adjustment.value() {
+                adjustment.set_value(x.max(0.0));
+            }
+        }
         stop_for_timer.set_visible(playback_for_timer.is_playing());
         roll_for_timer.queue_draw();
         glib::ControlFlow::Continue
@@ -1019,7 +1130,7 @@ fn build_ui(app: &Application) {
     content.append(&devices);
     content.append(&controls);
     content.append(&playback);
-    content.append(&roll);
+    content.append(&timeline);
     content.append(&status);
 
     ApplicationWindow::builder()
@@ -1064,6 +1175,29 @@ mod tests {
         let names = vec!["Other".to_string(), "Piano".to_string()];
         assert_eq!(preferred_index(&names, Some("Piano")), Some(1));
         assert_eq!(preferred_index(&names, Some("Missing")), None);
+    }
+
+    #[test]
+    fn playhead_maps_wall_time_to_musical_time() {
+        let playback = PlaybackControl::default();
+        let generation = playback.begin();
+        playback.set_timeline(generation, 1_000, 500, 900);
+        assert_eq!(playback.position(1_200), Some(700));
+        assert_eq!(playback.position(2_000), Some(900));
+        playback.finish(generation);
+        assert_eq!(playback.position(2_000), None);
+    }
+
+    #[test]
+    fn timeline_bounds_include_playhead() {
+        let notes = [Note {
+            pitch: 60,
+            onset_ms: 500,
+            duration_ms: 250,
+            velocity: 80,
+            generated: false,
+        }];
+        assert_eq!(timeline_bounds(&notes, Some(1_000)), Some((500, 1_000)));
     }
 
     #[test]
