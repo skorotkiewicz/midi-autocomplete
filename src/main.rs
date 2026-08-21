@@ -874,9 +874,10 @@ fn build_ui(app: &Application) {
     }
     let config = Arc::new(Mutex::new(initial_config));
     let model = Entry::builder()
-        .text("https://huggingface.co/Grizzlykw/midilm/resolve/main/medium.resume.pt?download=true")
+        .text("midilm/checkpoints/medium.pt")
         .hexpand(true)
         .build();
+    let model_browse = Button::with_label("Browse");
     let bpm = SpinButton::new(
         Some(&Adjustment::new(120.0, 30.0, 300.0, 1.0, 10.0, 0.0)),
         1.0,
@@ -1085,6 +1086,30 @@ fn build_ui(app: &Application) {
         chooser.show();
     });
 
+    let model_for_browse = model.clone();
+    model_browse.connect_clicked(move |_| {
+        let chooser = FileChooserNative::builder()
+            .title("Choose a Model Checkpoint")
+            .action(FileChooserAction::Open)
+            .accept_label("Open")
+            .build();
+        let filter = FileFilter::new();
+        filter.set_name(Some("PyTorch checkpoints"));
+        filter.add_pattern("*.pt");
+        filter.add_pattern("*.pth");
+        chooser.set_filter(&filter);
+        let entry = model_for_browse.clone();
+        chooser.connect_response(move |chooser, response| {
+            if response == ResponseType::Accept
+                && let Some(path) = chooser.file().and_then(|file| file.path())
+            {
+                let path = path.to_string_lossy().into_owned();
+                entry.set_text(&path);
+            }
+        });
+        chooser.show();
+    });
+
     let state_for_play = shared.clone();
     let output_for_play = output.clone();
     let playback_for_play = playback_control.clone();
@@ -1248,6 +1273,7 @@ fn build_ui(app: &Application) {
     let controls = GtkBox::new(Orientation::Horizontal, 8);
     controls.append(&Label::new(Some("Model")));
     controls.append(&model);
+    controls.append(&model_browse);
     controls.append(&Label::new(Some("BPM")));
     controls.append(&bpm);
     controls.append(&generate);
