@@ -680,7 +680,7 @@ fn replay(
         if !playback.is_active(generation) {
             return;
         }
-        let device = match DeviceSinkBuilder::open_default_sink() {
+        let mut device = match DeviceSinkBuilder::open_default_sink() {
             Ok(device) => device,
             Err(error) => {
                 if playback.is_active(generation) {
@@ -690,6 +690,7 @@ fn replay(
                 return;
             }
         };
+        device.log_on_drop(false);
         let player = Arc::new(Player::connect_new(device.mixer()));
         playback.set_player(generation, player.clone());
         if !playback.is_active(generation) {
