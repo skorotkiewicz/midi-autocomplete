@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 pub(crate) struct AppConfig {
     pub(crate) midi_input: Option<String>,
     pub(crate) midi_output: Option<String>,
+    pub(crate) model: Option<String>,
     pub(crate) soundfont: Option<String>,
 }
 

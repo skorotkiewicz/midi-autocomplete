@@ -88,11 +88,16 @@ pub(crate) fn build_ui(app: &Application) {
     if let Some(path) = &initial_config.soundfont {
         soundfont.set_text(path);
     }
-    let config = Arc::new(Mutex::new(initial_config));
     let model = Entry::builder()
-        .text("midilm/checkpoints/medium.pt")
+        .text(
+            initial_config
+                .model
+                .as_deref()
+                .unwrap_or("midilm/checkpoints/medium.pt"),
+        )
         .hexpand(true)
         .build();
+    let config = Arc::new(Mutex::new(initial_config));
     let model_browse = Button::with_label("Browse");
     let bpm = SpinButton::new(
         Some(&Adjustment::new(120.0, 30.0, 300.0, 1.0, 10.0, 0.0)),
@@ -303,6 +308,9 @@ pub(crate) fn build_ui(app: &Application) {
     });
 
     let model_for_browse = model.clone();
+    let config_for_model_browse = config.clone();
+    let path_for_model_browse = config_path.clone();
+    let state_for_model_browse = shared.clone();
     model_browse.connect_clicked(move |_| {
         let chooser = FileChooserNative::builder()
             .title("Choose a Model Checkpoint")
@@ -315,12 +323,23 @@ pub(crate) fn build_ui(app: &Application) {
         filter.add_pattern("*.pth");
         chooser.set_filter(&filter);
         let entry = model_for_browse.clone();
+        let config = config_for_model_browse.clone();
+        let config_path = path_for_model_browse.clone();
+        let state = state_for_model_browse.clone();
         chooser.connect_response(move |chooser, response| {
             if response == ResponseType::Accept
                 && let Some(path) = chooser.file().and_then(|file| file.path())
             {
                 let path = path.to_string_lossy().into_owned();
                 entry.set_text(&path);
+                let snapshot = {
+                    let mut config = config.lock().unwrap();
+                    config.model = Some(path);
+                    config.clone()
+                };
+                if let Err(error) = save_config(&config_path, &snapshot) {
+                    state.lock().unwrap().status = error;
+                }
             }
         });
         chooser.show();
@@ -409,6 +428,8 @@ pub(crate) fn build_ui(app: &Application) {
     let state_for_generate = shared.clone();
     let model_for_generate = model.clone();
     let bpm_for_generate = bpm.clone();
+    let config_for_generate = config.clone();
+    let path_for_generate = config_path.clone();
     generate.connect_clicked(move |_| {
         let state = state_for_generate.lock().unwrap();
         let input_notes = state.notes.iter().filter(|note| !note.generated).count();
@@ -418,8 +439,19 @@ pub(crate) fn build_ui(app: &Application) {
                 "Play at least one complete note first".into();
             return;
         }
+        let model_path = model_for_generate.text().to_string();
+        let snapshot = {
+            let mut config = config_for_generate.lock().unwrap();
+            config.model = Some(model_path.clone());
+            config.clone()
+        };
+        if let Err(error) = save_config(&path_for_generate, &snapshot) {
+            drop(state);
+            state_for_generate.lock().unwrap().status = error;
+            return;
+        }
         let request = GenerationRequest {
-            checkpoint: PathBuf::from(model_for_generate.text().as_str()),
+            checkpoint: PathBuf::from(model_path),
             prompt: prompt(&state.notes, bpm_for_generate.value()),
             bpm: bpm_for_generate.value(),
         };

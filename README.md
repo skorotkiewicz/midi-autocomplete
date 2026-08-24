@@ -13,7 +13,7 @@ Requirements: GTK4, ALSA development headers on Linux, Rust, and [uv](https://do
 cargo run --release
 ```
 
-1. Select a MIDI keyboard input and, optionally, a synth or keyboard output. Click **Refresh** after connecting new hardware.
+1. Select a MIDI keyboard input and a synth or keyboard output. Click **Refresh** after connecting new hardware.
 2. Click **Connect**, then **Rec** to capture a prompt. Click **Stop Rec** when the prompt is complete.
 3. Set the checkpoint path and performance BPM, then click **Autocomplete**.
 4. Choose a `.sf2` SoundFont and click **Play** to replay the full piano roll. **Stop** appears during playback.
@@ -22,7 +22,7 @@ The red playhead follows recording and playback on a horizontally scrollable tim
 
 ## Configuration
 
-The app saves device selections and the SoundFont path automatically. On startup it restores them and reconnects when both saved MIDI devices are available.
+The app saves the MIDI device selections, model checkpoint, and SoundFont path automatically. On startup it restores them and reconnects when both saved MIDI devices are available. If no model is saved, it uses `midilm/checkpoints/medium.pt`.
 
 ```text
 ~/.config/midi-autocomplete/config.toml
@@ -33,5 +33,6 @@ The app saves device selections and the SoundFont path automatically. On startup
 ```toml
 midi_input = "Digital Piano MIDI 1"
 midi_output = "Digital Piano MIDI 1"
+model = "midilm/checkpoints/medium.pt"
 soundfont = "/home/user/sounds/piano.sf2"
 ```

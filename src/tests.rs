@@ -17,6 +17,7 @@ fn config_round_trips() {
     let expected = AppConfig {
         midi_input: Some("Piano In".into()),
         midi_output: Some("Piano Out".into()),
+        model: Some("/models/medium.pt".into()),
         soundfont: Some("/sounds/piano.sf2".into()),
     };
     save_config(&path, &expected).unwrap();
