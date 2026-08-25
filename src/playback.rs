@@ -15,7 +15,10 @@ pub(crate) struct PlaybackControl {
     generation: AtomicU64,
     playing: AtomicBool,
     rendering: AtomicBool,
+    paused: AtomicBool,
     has_timeline: AtomicBool,
+    has_cursor: AtomicBool,
+    cursor_ms: AtomicU64,
     wall_start_ms: AtomicU64,
     musical_start_ms: AtomicU64,
     musical_end_ms: AtomicU64,
@@ -26,6 +29,7 @@ impl PlaybackControl {
     pub(crate) fn begin_rendering(&self) -> u64 {
         self.has_timeline.store(false, Ordering::SeqCst);
         self.rendering.store(true, Ordering::SeqCst);
+        self.paused.store(false, Ordering::SeqCst);
         self.playing.store(false, Ordering::SeqCst);
         let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
         if let Some(player) = self.player.lock().unwrap().take() {
@@ -43,7 +47,42 @@ impl PlaybackControl {
         true
     }
 
-    pub(crate) fn stop(&self) {
+    pub(crate) fn pause(&self, now_ms: u64) -> bool {
+        let Some(position) = self.position(now_ms) else {
+            return false;
+        };
+        self.cursor_ms.store(position, Ordering::SeqCst);
+        self.has_cursor.store(true, Ordering::SeqCst);
+        self.has_timeline.store(false, Ordering::SeqCst);
+        self.rendering.store(false, Ordering::SeqCst);
+        self.paused.store(true, Ordering::SeqCst);
+        self.playing.store(false, Ordering::SeqCst);
+        self.generation.fetch_add(1, Ordering::SeqCst);
+        if let Some(player) = self.player.lock().unwrap().take() {
+            player.stop();
+        }
+        true
+    }
+
+    pub(crate) fn stop(&self, now_ms: u64) {
+        if let Some(position) = self.position(now_ms).or_else(|| self.cursor()) {
+            self.cursor_ms.store(position, Ordering::SeqCst);
+            self.has_cursor.store(true, Ordering::SeqCst);
+        }
+        self.has_timeline.store(false, Ordering::SeqCst);
+        self.rendering.store(false, Ordering::SeqCst);
+        self.paused.store(false, Ordering::SeqCst);
+        self.playing.store(false, Ordering::SeqCst);
+        self.generation.fetch_add(1, Ordering::SeqCst);
+        if let Some(player) = self.player.lock().unwrap().take() {
+            player.stop();
+        }
+    }
+
+    pub(crate) fn seek(&self, position_ms: u64) -> bool {
+        let was_playing = self.is_playing();
+        self.cursor_ms.store(position_ms, Ordering::SeqCst);
+        self.has_cursor.store(true, Ordering::SeqCst);
         self.has_timeline.store(false, Ordering::SeqCst);
         self.rendering.store(false, Ordering::SeqCst);
         self.playing.store(false, Ordering::SeqCst);
@@ -51,6 +90,12 @@ impl PlaybackControl {
         if let Some(player) = self.player.lock().unwrap().take() {
             player.stop();
         }
+        was_playing
+    }
+
+    pub(crate) fn reset(&self) {
+        self.stop(0);
+        self.has_cursor.store(false, Ordering::SeqCst);
     }
 
     pub(crate) fn is_active(&self, generation: u64) -> bool {
@@ -63,6 +108,16 @@ impl PlaybackControl {
 
     pub(crate) fn is_rendering(&self) -> bool {
         self.rendering.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn is_paused(&self) -> bool {
+        self.paused.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn cursor(&self) -> Option<u64> {
+        self.has_cursor
+            .load(Ordering::SeqCst)
+            .then(|| self.cursor_ms.load(Ordering::SeqCst))
     }
 
     pub(crate) fn set_timeline(
@@ -105,7 +160,9 @@ impl PlaybackControl {
         let mut current = self.player.lock().unwrap();
         if self.is_active(generation) {
             self.has_timeline.store(false, Ordering::SeqCst);
+            self.has_cursor.store(false, Ordering::SeqCst);
             self.rendering.store(false, Ordering::SeqCst);
+            self.paused.store(false, Ordering::SeqCst);
             self.playing.store(false, Ordering::SeqCst);
             current.take();
         }
@@ -145,25 +202,29 @@ pub(crate) fn send_midi_events(
     }
 }
 
-pub(crate) fn replay_events(notes: &[Note]) -> Result<Vec<MidiEvent>, String> {
-    let first = notes
-        .iter()
-        .map(|note| note.onset_ms)
-        .min()
-        .ok_or("Nothing to play")?;
+pub(crate) fn replay_events_from(
+    notes: &[Note],
+    musical_start_ms: u64,
+) -> Result<Vec<MidiEvent>, String> {
     let end = notes
         .iter()
         .map(|note| note.onset_ms + note.duration_ms)
+        .filter(|end| *end > musical_start_ms)
         .max()
-        .unwrap();
-    if end.saturating_sub(first) > MAX_PLAYBACK_MS {
+        .ok_or("Nothing to play from this position")?;
+    if end.saturating_sub(musical_start_ms) > MAX_PLAYBACK_MS {
         return Err("Playback is limited to five minutes. Clear older notes first.".into());
     }
     let mut events = Vec::with_capacity(notes.len() * 2);
     for note in notes {
-        let onset = 100 + note.onset_ms.saturating_sub(first);
+        let note_end = note.onset_ms + note.duration_ms;
+        if note_end <= musical_start_ms {
+            continue;
+        }
+        let clipped_onset = note.onset_ms.max(musical_start_ms);
+        let onset = 100 + clipped_onset - musical_start_ms;
         events.push((onset, true, note.pitch, note.velocity));
-        events.push((onset + note.duration_ms, false, note.pitch, 0));
+        events.push((onset + note_end - clipped_onset, false, note.pitch, 0));
     }
     events.sort_by_key(|event| (event.0, event.1));
     Ok(events)
@@ -209,15 +270,19 @@ pub(crate) fn render_soundfont(path: &Path, events: &[MidiEvent]) -> Result<Vec<
 pub(crate) fn replay(
     notes: Vec<Note>,
     soundfont: PathBuf,
+    musical_start_ms: Option<u64>,
     started: Instant,
     shared: Arc<Mutex<Shared>>,
     output: Arc<Mutex<Option<MidiOutputConnection>>>,
     playback: Arc<PlaybackControl>,
 ) {
+    let musical_start_ms = musical_start_ms
+        .or_else(|| notes.iter().map(|note| note.onset_ms).min())
+        .unwrap_or(0);
     let generation = playback.begin_rendering();
     shared.lock().unwrap().status = "Rendering SoundFont...".into();
     thread::spawn(move || {
-        let events = match replay_events(&notes) {
+        let events = match replay_events_from(&notes, musical_start_ms) {
             Ok(events) => events,
             Err(error) => {
                 if playback.is_active(generation) {
@@ -260,13 +325,13 @@ pub(crate) fn replay(
             return;
         }
         let base = started.elapsed().as_millis() as u64;
-        let first = notes.iter().map(|note| note.onset_ms).min().unwrap();
         let end = notes
             .iter()
             .map(|note| note.onset_ms + note.duration_ms)
             .max()
             .unwrap();
-        playback.set_timeline(generation, base + 100, first, end);
+        playback.set_timeline(generation, base + 100, musical_start_ms, end);
+        let note_count = events.len() / 2;
         let midi_events = events
             .into_iter()
             .map(|(time, on, pitch, velocity)| (base + time, on, pitch, velocity))
@@ -276,7 +341,7 @@ pub(crate) fn replay(
         let midi = thread::spawn(move || {
             send_midi_events(midi_events, started, midi_output, midi_playback, generation)
         });
-        shared.lock().unwrap().status = format!("Playing {} notes", notes.len());
+        shared.lock().unwrap().status = format!("Playing {note_count} notes");
         player.append(SamplesBuffer::new(
             NonZeroU16::new(2).unwrap(),
             NonZeroU32::new(SAMPLE_RATE).unwrap(),
@@ -294,18 +359,21 @@ pub(crate) fn replay(
 pub(crate) fn add_generated(
     generated: Vec<(u8, u64, u64, u8)>,
     bpm: f64,
+    musical_start_ms: Option<u64>,
     shared: Arc<Mutex<Shared>>,
 ) {
     let step_ms = 60_000.0 / bpm / 24.0;
-    let musical_base = shared
-        .lock()
-        .unwrap()
-        .notes
-        .iter()
-        .filter(|note| !note.generated)
-        .map(|note| note.onset_ms)
-        .max()
-        .unwrap_or(0);
+    let musical_base = musical_start_ms.unwrap_or_else(|| {
+        shared
+            .lock()
+            .unwrap()
+            .notes
+            .iter()
+            .filter(|note| !note.generated)
+            .map(|note| note.onset_ms)
+            .max()
+            .unwrap_or(0)
+    });
     let mut onset = musical_base;
     let mut notes: Vec<Note> = Vec::new();
     for (pitch, delta, duration, velocity) in generated {
@@ -326,6 +394,14 @@ pub(crate) fn add_generated(
     }
     let count = notes.len();
     let mut state = shared.lock().unwrap();
+    for note in state.notes.iter_mut().filter(|note| note.generated) {
+        if note.onset_ms < musical_base && note.onset_ms + note.duration_ms > musical_base {
+            note.duration_ms = musical_base - note.onset_ms;
+        }
+    }
+    state
+        .notes
+        .retain(|note| !note.generated || note.onset_ms < musical_base);
     state.notes.extend(notes);
     state.status = if count == 0 {
         "Model generated no notes".into()

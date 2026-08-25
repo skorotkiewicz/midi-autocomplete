@@ -7,6 +7,7 @@ pub(crate) struct GenerationRequest {
     pub(crate) checkpoint: PathBuf,
     pub(crate) prompt: String,
     pub(crate) bpm: f64,
+    pub(crate) musical_start_ms: Option<u64>,
 }
 
 pub(crate) struct ModelProcess {
@@ -120,10 +121,10 @@ pub(crate) fn resolve_model_path(path: &Path) -> PathBuf {
     joined.canonicalize().unwrap_or(joined)
 }
 
-pub(crate) fn prompt(notes: &[Note], bpm: f64) -> String {
+pub(crate) fn prompt(notes: &[Note], bpm: f64, musical_end_ms: Option<u64>) -> String {
     let mut notes: Vec<_> = notes
         .iter()
-        .filter(|note| !note.generated)
+        .filter(|note| !note.generated && musical_end_ms.is_none_or(|end| note.onset_ms <= end))
         .copied()
         .collect();
     notes.sort_by_key(|note| (note.onset_ms, note.pitch));

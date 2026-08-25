@@ -8,8 +8,8 @@ use gtk4::glib;
 use gtk4::prelude::*;
 use gtk4::{
     Adjustment, Application, ApplicationWindow, Box as GtkBox, Button, DrawingArea, DropDown,
-    Entry, FileChooserAction, FileChooserNative, FileFilter, Label, Orientation, PolicyType,
-    ResponseType, ScrolledWindow, SpinButton,
+    Entry, FileChooserAction, FileChooserNative, FileFilter, GestureClick, Label, Orientation,
+    PolicyType, ResponseType, ScrolledWindow, SpinButton,
 };
 use midir::{MidiInputConnection, MidiOutputConnection};
 use std::cell::RefCell;
@@ -78,7 +78,9 @@ pub(crate) fn build_ui(app: &Application) {
     let clear = Button::with_label("Clear");
     let generate = Button::with_label("Autocomplete");
     let play = Button::with_label("Play");
+    let pause = Button::with_label("Pause");
     let stop = Button::with_label("Stop");
+    pause.set_visible(false);
     stop.set_visible(false);
     let browse = Button::with_label("Browse");
     let soundfont = Entry::builder()
@@ -129,7 +131,7 @@ pub(crate) fn build_ui(app: &Application) {
         } else if state.capturing {
             Some(state.capture_position(now))
         } else {
-            None
+            playback_for_draw.cursor()
         };
         draw_roll(cr, width, height, &state.notes, playhead);
     });
@@ -262,7 +264,9 @@ pub(crate) fn build_ui(app: &Application) {
     });
 
     let state_for_clear = shared.clone();
+    let playback_for_clear = playback_control.clone();
     clear.connect_clicked(move |_| {
+        playback_for_clear.reset();
         state_for_clear
             .lock()
             .unwrap()
@@ -375,9 +379,11 @@ pub(crate) fn build_ui(app: &Application) {
             state_for_play.lock().unwrap().status = "Nothing to play".into();
             return;
         }
+        let musical_start_ms = playback_for_play.cursor();
         replay(
             notes,
             path,
+            musical_start_ms,
             started,
             state_for_play.clone(),
             output_for_play.clone(),
@@ -385,12 +391,62 @@ pub(crate) fn build_ui(app: &Application) {
         );
     });
 
+    let state_for_pause = shared.clone();
+    let playback_for_pause = playback_control.clone();
+    pause.connect_clicked(move |_| {
+        if playback_for_pause.pause(started.elapsed().as_millis() as u64) {
+            state_for_pause.lock().unwrap().status = "Paused".into();
+        }
+    });
+
     let state_for_stop = shared.clone();
     let playback_for_stop = playback_control.clone();
     stop.connect_clicked(move |_| {
-        playback_for_stop.stop();
+        playback_for_stop.stop(started.elapsed().as_millis() as u64);
         state_for_stop.lock().unwrap().status = "Stopped".into();
     });
+
+    let seek = GestureClick::new();
+    let state_for_seek = shared.clone();
+    let output_for_seek = output.clone();
+    let playback_for_seek = playback_control.clone();
+    let soundfont_for_seek = soundfont.clone();
+    seek.connect_pressed(move |_, _, x, _| {
+        let now = started.elapsed().as_millis() as u64;
+        let (notes, bounds) = {
+            let state = state_for_seek.lock().unwrap();
+            let playhead = playback_for_seek
+                .position(now)
+                .or_else(|| playback_for_seek.cursor())
+                .or_else(|| state.capturing.then(|| state.capture_position(now)));
+            (state.notes.clone(), timeline_bounds(&state.notes, playhead))
+        };
+        let Some((start, end)) = bounds else {
+            return;
+        };
+        let position = (start + (x.max(0.0) / PIXELS_PER_MS) as u64).min(end);
+        let was_playing = playback_for_seek.seek(position);
+        state_for_seek.lock().unwrap().status =
+            format!("Position: {:.2}s", position as f64 / 1_000.0);
+        if !was_playing {
+            return;
+        }
+        let path = PathBuf::from(soundfont_for_seek.text().as_str());
+        if path.as_os_str().is_empty() {
+            state_for_seek.lock().unwrap().status = "Choose a .sf2 SoundFont first".into();
+            return;
+        }
+        replay(
+            notes,
+            path,
+            Some(position),
+            started,
+            state_for_seek.clone(),
+            output_for_seek.clone(),
+            playback_for_seek.clone(),
+        );
+    });
+    roll.add_controller(seek);
 
     let (requests, receiver) = mpsc::channel::<GenerationRequest>();
     let worker_state = shared.clone();
@@ -411,7 +467,12 @@ pub(crate) fn build_ui(app: &Application) {
             }
             worker_state.lock().unwrap().status = "Generating...".into();
             match process.as_mut().unwrap().generate(&request.prompt) {
-                Ok(notes) => add_generated(notes, request.bpm, worker_state.clone()),
+                Ok(notes) => add_generated(
+                    notes,
+                    request.bpm,
+                    request.musical_start_ms,
+                    worker_state.clone(),
+                ),
                 Err(error) => {
                     worker_state.lock().unwrap().status = error;
                     process = None;
@@ -425,13 +486,17 @@ pub(crate) fn build_ui(app: &Application) {
     let bpm_for_generate = bpm.clone();
     let config_for_generate = config.clone();
     let path_for_generate = config_path.clone();
+    let playback_for_generate = playback_control.clone();
     generate.connect_clicked(move |_| {
+        let musical_start_ms = playback_for_generate
+            .position(started.elapsed().as_millis() as u64)
+            .or_else(|| playback_for_generate.cursor());
         let state = state_for_generate.lock().unwrap();
-        let input_notes = state.notes.iter().filter(|note| !note.generated).count();
-        if input_notes == 0 {
+        let prompt_text = prompt(&state.notes, bpm_for_generate.value(), musical_start_ms);
+        if prompt_text.is_empty() {
             drop(state);
             state_for_generate.lock().unwrap().status =
-                "Play at least one complete note first".into();
+                "Play at least one complete note before this position".into();
             return;
         }
         let model_path = model_for_generate.text().to_string();
@@ -447,8 +512,9 @@ pub(crate) fn build_ui(app: &Application) {
         }
         let request = GenerationRequest {
             checkpoint: PathBuf::from(model_path),
-            prompt: prompt(&state.notes, bpm_for_generate.value()),
+            prompt: prompt_text,
             bpm: bpm_for_generate.value(),
+            musical_start_ms,
         };
         drop(state);
         let _ = requests.send(request);
@@ -459,6 +525,7 @@ pub(crate) fn build_ui(app: &Application) {
     let state_for_timer = shared.clone();
     let status_for_timer = status.clone();
     let play_for_timer = play.clone();
+    let pause_for_timer = pause.clone();
     let stop_for_timer = stop.clone();
     let record_for_timer = record.clone();
     let playback_for_timer = playback_control.clone();
@@ -470,7 +537,7 @@ pub(crate) fn build_ui(app: &Application) {
         } else if state.capturing {
             Some(state.capture_position(now))
         } else {
-            None
+            playback_for_timer.cursor()
         };
         let timeline_position =
             playhead.or_else(|| state.connected.then(|| state.capture_position(now)));
@@ -499,9 +566,12 @@ pub(crate) fn build_ui(app: &Application) {
             "Rec"
         });
         let playing = playback_for_timer.is_playing();
+        let paused = playback_for_timer.is_paused();
+        play_for_timer.set_label(if paused { "Resume" } else { "Play" });
         play_for_timer.set_visible(!playing);
         play_for_timer.set_sensitive(!playback_for_timer.is_rendering());
-        stop_for_timer.set_visible(playing);
+        pause_for_timer.set_visible(playing);
+        stop_for_timer.set_visible(playing || paused);
         roll_for_timer.queue_draw();
         glib::ControlFlow::Continue
     });
@@ -529,6 +599,7 @@ pub(crate) fn build_ui(app: &Application) {
     playback.append(&browse);
     playback.append(&record);
     playback.append(&play);
+    playback.append(&pause);
     playback.append(&stop);
 
     let content = GtkBox::new(Orientation::Vertical, 8);

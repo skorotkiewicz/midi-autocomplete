@@ -2,7 +2,7 @@ use crate::config::{AppConfig, config_path, load_config, save_config};
 use crate::midi::{connect_output, midi_inputs, midi_outputs};
 use crate::model::{prompt, repo_root, resolve_model_path};
 use crate::playback::{
-    PlaybackControl, add_generated, render_soundfont, replay_events, send_midi_events,
+    PlaybackControl, add_generated, render_soundfont, replay_events_from, send_midi_events,
 };
 use crate::state::{Note, Shared};
 use crate::timeline::timeline_bounds;
@@ -70,6 +70,23 @@ fn soundfont_rendering_is_not_playback() {
 }
 
 #[test]
+fn pause_and_seek_preserve_the_cursor() {
+    let playback = PlaybackControl::default();
+    let generation = playback.begin_rendering();
+    assert!(playback.start_playback(generation));
+    playback.set_timeline(generation, 1_000, 500, 2_000);
+
+    assert!(playback.pause(1_250));
+    assert_eq!(playback.cursor(), Some(750));
+    assert!(playback.is_paused());
+    assert!(!playback.is_playing());
+
+    assert!(!playback.seek(1_500));
+    assert_eq!(playback.cursor(), Some(1_500));
+    assert!(playback.is_paused());
+}
+
+#[test]
 fn timeline_bounds_include_playhead() {
     let notes = [Note {
         pitch: 60,
@@ -96,7 +113,7 @@ fn recording_resumes_from_its_frozen_position() {
 #[test]
 fn generated_notes_wait_for_soundfont_playback() {
     let shared = Arc::new(Mutex::new(Shared::default()));
-    add_generated(vec![(64, 0, 12, 90)], 120.0, shared.clone());
+    add_generated(vec![(64, 0, 12, 90)], 120.0, None, shared.clone());
 
     let state = shared.lock().unwrap();
     assert_eq!(state.notes.len(), 1);
@@ -126,7 +143,7 @@ fn replay_normalizes_the_musical_timeline() {
         },
     ];
     assert_eq!(
-        replay_events(&notes).unwrap(),
+        replay_events_from(&notes, 500).unwrap(),
         vec![
             (100, true, 60, 80),
             (350, false, 60, 0),
@@ -137,12 +154,70 @@ fn replay_normalizes_the_musical_timeline() {
 }
 
 #[test]
+fn replay_from_cursor_clips_notes_already_in_progress() {
+    let notes = [
+        Note {
+            pitch: 60,
+            onset_ms: 500,
+            duration_ms: 500,
+            velocity: 80,
+            generated: false,
+        },
+        Note {
+            pitch: 64,
+            onset_ms: 1_200,
+            duration_ms: 100,
+            velocity: 90,
+            generated: true,
+        },
+    ];
+    assert_eq!(
+        replay_events_from(&notes, 750).unwrap(),
+        vec![
+            (100, true, 60, 80),
+            (350, false, 60, 0),
+            (550, true, 64, 90),
+            (650, false, 64, 0),
+        ]
+    );
+}
+
+#[test]
+fn autocomplete_replaces_generated_notes_after_cursor() {
+    let shared = Arc::new(Mutex::new(Shared {
+        notes: vec![
+            Note {
+                pitch: 60,
+                onset_ms: 0,
+                duration_ms: 100,
+                velocity: 80,
+                generated: false,
+            },
+            Note {
+                pitch: 62,
+                onset_ms: 1_000,
+                duration_ms: 100,
+                velocity: 80,
+                generated: true,
+            },
+        ],
+        ..Default::default()
+    }));
+    add_generated(vec![(64, 0, 12, 90)], 120.0, Some(500), shared.clone());
+
+    let state = shared.lock().unwrap();
+    assert_eq!(state.notes.len(), 2);
+    assert_eq!(state.notes[1].pitch, 64);
+    assert_eq!(state.notes[1].onset_ms, 500);
+}
+
+#[test]
 fn stop_cancels_scheduled_midi_without_waiting() {
     let playback = Arc::new(PlaybackControl::default());
     let generation = playback.begin_rendering();
     assert!(playback.start_playback(generation));
     assert!(playback.is_playing());
-    playback.stop();
+    playback.stop(0);
     assert!(!playback.is_playing());
     let started = Instant::now();
     send_midi_events(
@@ -156,6 +231,27 @@ fn stop_cancels_scheduled_midi_without_waiting() {
 }
 
 #[test]
+fn prompt_stops_at_the_cursor() {
+    let notes = [
+        Note {
+            pitch: 60,
+            onset_ms: 0,
+            duration_ms: 250,
+            velocity: 80,
+            generated: false,
+        },
+        Note {
+            pitch: 64,
+            onset_ms: 1_000,
+            duration_ms: 250,
+            velocity: 90,
+            generated: false,
+        },
+    ];
+    assert_eq!(prompt(&notes, 120.0, Some(500)), "60,0,12,80");
+}
+
+#[test]
 fn prompt_quantizes_at_24_steps_per_quarter() {
     let notes = [Note {
         pitch: 60,
@@ -164,7 +260,7 @@ fn prompt_quantizes_at_24_steps_per_quarter() {
         velocity: 80,
         generated: false,
     }];
-    assert_eq!(prompt(&notes, 120.0), "60,0,12,80");
+    assert_eq!(prompt(&notes, 120.0, None), "60,0,12,80");
 }
 
 // Hardware-in-the-loop integration tests. Run with `cargo test -- --ignored`.
