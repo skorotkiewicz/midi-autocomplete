@@ -29,6 +29,7 @@ fn config_round_trips() {
         midi_output: Some("Piano Out".into()),
         model: Some("/models/medium.pt".into()),
         soundfont: Some("/sounds/piano.sf2".into()),
+        auto_pause_ms: 1_200,
     };
     save_config(&path, &expected).unwrap();
     assert_eq!(load_config(&path).unwrap(), expected);
@@ -37,11 +38,13 @@ fn config_round_trips() {
 
 #[test]
 fn auto_generation_waits_for_a_complete_idle_pause() {
-    assert!(!auto_generation_due(800, 0, false, false, 1, 0));
-    assert!(!auto_generation_due(799, 0, true, false, 1, 0));
-    assert!(!auto_generation_due(800, 0, true, true, 1, 0));
-    assert!(!auto_generation_due(800, 0, true, false, 1, 1));
-    assert!(auto_generation_due(800, 0, true, false, 1, 0));
+    assert!(!auto_generation_due(800, 0, 800, false, false, 1, 0));
+    assert!(!auto_generation_due(799, 0, 800, true, false, 1, 0));
+    assert!(!auto_generation_due(800, 0, 800, true, true, 1, 0));
+    assert!(!auto_generation_due(800, 0, 800, true, false, 1, 1));
+    assert!(auto_generation_due(800, 0, 800, true, false, 1, 0));
+    assert!(!auto_generation_due(1_199, 0, 1_200, true, false, 1, 0));
+    assert!(auto_generation_due(1_200, 0, 1_200, true, false, 1, 0));
 }
 
 #[test]

@@ -4,6 +4,9 @@
 default:
     @just --list
 
+build-agent:
+    CARGO_TARGET_DIR=/tmp/agent-target cargo build --release
+
 build:
     cargo build --release
 

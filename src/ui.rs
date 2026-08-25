@@ -25,11 +25,10 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
-const AUTO_PAUSE_MS: u64 = 800;
-
 pub(crate) fn auto_generation_due(
     now_ms: u64,
     last_input_ms: u64,
+    auto_pause_ms: u64,
     capture_has_input: bool,
     input_active: bool,
     input_notes: usize,
@@ -38,7 +37,7 @@ pub(crate) fn auto_generation_due(
     capture_has_input
         && !input_active
         && input_notes > requested_notes
-        && now_ms.saturating_sub(last_input_ms) >= AUTO_PAUSE_MS
+        && now_ms.saturating_sub(last_input_ms) >= auto_pause_ms
 }
 
 pub(crate) fn preferred_index(names: &[String], preferred: Option<&str>) -> Option<u32> {
@@ -206,6 +205,8 @@ pub(crate) fn build_ui(app: &Application) {
         )
         .hexpand(true)
         .build();
+    let auto_pause = SpinButton::with_range(200.0, 3_000.0, 100.0);
+    auto_pause.set_value(initial_config.auto_pause_ms as f64);
     let config = Arc::new(Mutex::new(initial_config));
     let model_browse = Button::with_label("Browse");
     let bpm = SpinButton::new(
@@ -274,6 +275,20 @@ pub(crate) fn build_ui(app: &Application) {
         };
         if let Err(error) = save_config(&path_for_input, &snapshot) {
             state_for_input.lock().unwrap().status = error;
+        }
+    });
+
+    let config_for_auto_pause = config.clone();
+    let path_for_auto_pause = config_path.clone();
+    let state_for_auto_pause = shared.clone();
+    auto_pause.connect_value_changed(move |input| {
+        let snapshot = {
+            let mut config = config_for_auto_pause.lock().unwrap();
+            config.auto_pause_ms = input.value_as_int() as u64;
+            config.clone()
+        };
+        if let Err(error) = save_config(&path_for_auto_pause, &snapshot) {
+            state_for_auto_pause.lock().unwrap().status = error;
         }
     });
 
@@ -815,6 +830,7 @@ pub(crate) fn build_ui(app: &Application) {
     let auto_generation = generation_controls.clone();
     let generation_busy_for_timer = generation_busy.clone();
     let auto_resume_for_timer = auto_resume.clone();
+    let auto_pause_for_timer = auto_pause.clone();
     let mut auto_requested_notes = 0;
     glib::timeout_add_local(Duration::from_millis(33), move || {
         let now = started.elapsed().as_millis() as u64;
@@ -843,6 +859,7 @@ pub(crate) fn build_ui(app: &Application) {
                 && auto_generation_due(
                     now,
                     state.last_input_ms,
+                    auto_pause_for_timer.value_as_int() as u64,
                     state.capture_has_input,
                     state.input_active,
                     input_notes,
@@ -945,6 +962,13 @@ pub(crate) fn build_ui(app: &Application) {
     settings.append(&soundfont_row);
     settings.append(&Label::builder().label("BPM").xalign(0.0).build());
     settings.append(&bpm);
+    settings.append(
+        &Label::builder()
+            .label("Auto delay (ms)")
+            .xalign(0.0)
+            .build(),
+    );
+    settings.append(&auto_pause);
     let settings_popover = Popover::new();
     settings_popover.set_child(Some(&settings));
     let settings_menu = MenuButton::builder()
