@@ -17,6 +17,7 @@ pub(crate) struct Shared {
     pub(crate) capture_started_ms: u64,
     pub(crate) capture_position_ms: u64,
     pub(crate) input_active: bool,
+    pub(crate) capture_has_input: bool,
     pub(crate) last_input_ms: u64,
     pub(crate) generation_revision: u64,
 }
@@ -48,13 +49,14 @@ impl Shared {
         self.capturing = false;
         self.capture_generation = self.capture_generation.wrapping_add(1);
         self.input_active = false;
+        self.capture_has_input = false;
         self.last_input_ms = now_ms;
         self.invalidate_generation();
     }
 
     pub(crate) fn capture_position(&self, now_ms: u64) -> u64 {
         self.capture_position_ms
-            + if self.capturing {
+            + if self.capturing && self.capture_has_input {
                 now_ms.saturating_sub(self.capture_started_ms)
             } else {
                 0
@@ -85,9 +87,12 @@ impl Shared {
         self.capture_generation = self.capture_generation.wrapping_add(1);
         self.invalidate_generation();
         self.input_active = false;
+        if self.capturing {
+            self.capture_has_input = false;
+        }
         self.last_input_ms = now_ms;
         self.status = if self.capturing {
-            "Recording MIDI prompt...".into()
+            "Waiting for MIDI input...".into()
         } else {
             "Recording stopped.".into()
         };
@@ -101,6 +106,7 @@ impl Shared {
         self.capture_generation = self.capture_generation.wrapping_add(1);
         self.invalidate_generation();
         self.input_active = false;
+        self.capture_has_input = false;
         self.last_input_ms = now_ms;
     }
 }

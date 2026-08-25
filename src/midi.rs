@@ -38,9 +38,9 @@ impl Capture {
         }
     }
 
-    fn receive(&mut self, bytes: &[u8], now_ms: u64, shared: &Arc<Mutex<Shared>>) -> bool {
+    fn receive(&mut self, bytes: &[u8], now_ms: u64, shared: &Arc<Mutex<Shared>>) -> Option<bool> {
         let Ok(LiveEvent::Midi { message, .. }) = LiveEvent::parse(bytes) else {
-            return false;
+            return None;
         };
         // ponytail: piano input treats all MIDI channels as one; split by channel if multi-instrument input matters.
         match message {
@@ -74,9 +74,12 @@ impl Capture {
                     }
                 }
             }
-            _ => return false,
+            _ => return None,
         }
-        true
+        Some(matches!(
+            message,
+            MidiMessage::NoteOn { vel, .. } if vel.as_int() > 0
+        ))
     }
 }
 
@@ -141,11 +144,18 @@ pub(crate) fn connect_input(
                     capture_generation = generation;
                 }
                 if let Some(position) = position
-                    && capture.receive(message, position, &shared)
+                    && let Some(starts_capture) = capture.receive(message, position, &shared)
                 {
                     let mut state = shared.lock().unwrap();
-                    state.input_active = capture.held.iter().any(Option::is_some);
-                    state.last_input_ms = now;
+                    if starts_capture && !state.capture_has_input {
+                        state.capture_started_ms = now;
+                        state.capture_has_input = true;
+                        state.status = "Recording MIDI prompt...".into();
+                    }
+                    if state.capture_has_input {
+                        state.input_active = capture.held.iter().any(Option::is_some);
+                        state.last_input_ms = now;
+                    }
                 }
             },
             (),

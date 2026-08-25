@@ -37,10 +37,11 @@ fn config_round_trips() {
 
 #[test]
 fn auto_generation_waits_for_a_complete_idle_pause() {
-    assert!(!auto_generation_due(799, 0, false, 1, 0));
-    assert!(!auto_generation_due(800, 0, true, 1, 0));
-    assert!(!auto_generation_due(800, 0, false, 1, 1));
-    assert!(auto_generation_due(800, 0, false, 1, 0));
+    assert!(!auto_generation_due(800, 0, false, false, 1, 0));
+    assert!(!auto_generation_due(799, 0, true, false, 1, 0));
+    assert!(!auto_generation_due(800, 0, true, true, 1, 0));
+    assert!(!auto_generation_due(800, 0, true, false, 1, 1));
+    assert!(auto_generation_due(800, 0, true, false, 1, 0));
 }
 
 #[test]
@@ -237,12 +238,35 @@ fn timeline_bounds_include_playhead() {
 fn recording_resumes_from_its_frozen_position() {
     let mut state = Shared::default();
     assert!(state.toggle_capture(100, None));
-    assert_eq!(state.capture_position(250), 150);
-    assert!(!state.toggle_capture(250, None));
+    assert_eq!(state.capture_position(250), 0);
+    state.capture_started_ms = 250;
+    state.capture_has_input = true;
+    assert_eq!(state.capture_position(400), 150);
+
+    assert!(!state.toggle_capture(400, None));
     assert_eq!(state.capture_position(5_000), 150);
     assert!(state.toggle_capture(5_000, None));
-    assert_eq!(state.capture_position(5_100), 250);
+    assert_eq!(state.capture_position(5_100), 150);
+    state.capture_started_ms = 5_100;
+    state.capture_has_input = true;
+    assert_eq!(state.capture_position(5_200), 250);
     assert_eq!(state.capture_generation, 3);
+}
+
+#[test]
+fn every_recording_session_waits_for_fresh_input() {
+    let mut state = Shared::default();
+    assert!(state.toggle_capture(0, Some(500)));
+    assert_eq!(state.capture_position(1_000), 500);
+
+    state.capture_started_ms = 1_000;
+    state.capture_has_input = true;
+    assert_eq!(state.capture_position(1_100), 600);
+
+    assert!(!state.toggle_capture(1_100, None));
+    assert!(state.toggle_capture(1_200, None));
+    assert!(!state.capture_has_input);
+    assert_eq!(state.capture_position(2_000), 600);
 }
 
 #[test]
@@ -259,7 +283,10 @@ fn recording_starts_from_the_selected_timeline_position() {
     };
 
     assert!(state.toggle_capture(100, Some(250)));
-    assert_eq!(state.capture_position(200), 350);
+    assert_eq!(state.capture_position(200), 250);
+    state.capture_started_ms = 200;
+    state.capture_has_input = true;
+    assert_eq!(state.capture_position(300), 350);
 }
 
 #[test]

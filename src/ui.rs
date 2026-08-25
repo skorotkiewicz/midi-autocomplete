@@ -29,11 +29,13 @@ const AUTO_PAUSE_MS: u64 = 800;
 pub(crate) fn auto_generation_due(
     now_ms: u64,
     last_input_ms: u64,
+    capture_has_input: bool,
     input_active: bool,
     input_notes: usize,
     requested_notes: usize,
 ) -> bool {
-    !input_active
+    capture_has_input
+        && !input_active
         && input_notes > requested_notes
         && now_ms.saturating_sub(last_input_ms) >= AUTO_PAUSE_MS
 }
@@ -833,6 +835,7 @@ pub(crate) fn build_ui(app: &Application) {
                 && auto_generation_due(
                     now,
                     state.last_input_ms,
+                    state.capture_has_input,
                     state.input_active,
                     input_notes,
                     auto_requested_notes,
