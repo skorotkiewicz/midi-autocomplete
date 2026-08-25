@@ -5,130 +5,173 @@ use rustysynth::{SoundFont, Synthesizer, SynthesizerSettings};
 use std::fs::File;
 use std::num::{NonZeroU16, NonZeroU32};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+#[derive(Clone, Copy, Default, PartialEq)]
+enum PlaybackPhase {
+    #[default]
+    Idle,
+    Rendering,
+    Playing,
+    Paused,
+}
+
+#[derive(Clone, Copy)]
+struct PlaybackTimeline {
+    wall_start_ms: u64,
+    musical_start_ms: u64,
+    musical_end_ms: u64,
+}
+
+#[derive(Default)]
+struct PlaybackState {
+    generation: u64,
+    phase: PlaybackPhase,
+    cursor_ms: Option<u64>,
+    resume_from_cursor: bool,
+    timeline: Option<PlaybackTimeline>,
+    player: Option<Arc<Player>>,
+}
+
 #[derive(Default)]
 pub(crate) struct PlaybackControl {
-    generation: AtomicU64,
-    playing: AtomicBool,
-    rendering: AtomicBool,
-    paused: AtomicBool,
-    resume_from_cursor: AtomicBool,
-    has_timeline: AtomicBool,
-    has_cursor: AtomicBool,
-    cursor_ms: AtomicU64,
-    wall_start_ms: AtomicU64,
-    musical_start_ms: AtomicU64,
-    musical_end_ms: AtomicU64,
-    player: Mutex<Option<Arc<Player>>>,
+    state: Mutex<PlaybackState>,
 }
 
 impl PlaybackControl {
     pub(crate) fn begin_rendering(&self) -> u64 {
-        self.has_timeline.store(false, Ordering::SeqCst);
-        self.rendering.store(true, Ordering::SeqCst);
-        self.paused.store(false, Ordering::SeqCst);
-        self.resume_from_cursor.store(false, Ordering::SeqCst);
-        self.playing.store(false, Ordering::SeqCst);
-        let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
-        if let Some(player) = self.player.lock().unwrap().take() {
+        let (generation, player) = {
+            let mut state = self.state.lock().unwrap();
+            state.generation = state.generation.wrapping_add(1);
+            state.phase = PlaybackPhase::Rendering;
+            state.resume_from_cursor = false;
+            state.timeline = None;
+            (state.generation, state.player.take())
+        };
+        if let Some(player) = player {
             player.stop();
         }
         generation
     }
 
     pub(crate) fn start_playback(&self, generation: u64) -> bool {
-        if !self.is_active(generation) {
+        let mut state = self.state.lock().unwrap();
+        if state.generation != generation || state.phase != PlaybackPhase::Rendering {
             return false;
         }
-        self.rendering.store(false, Ordering::SeqCst);
-        self.playing.store(true, Ordering::SeqCst);
+        state.phase = PlaybackPhase::Playing;
         true
     }
 
     pub(crate) fn pause(&self, now_ms: u64) -> bool {
-        let Some(position) = self.position(now_ms) else {
-            return false;
+        let player = {
+            let mut state = self.state.lock().unwrap();
+            let Some(position) = Self::position_locked(&state, now_ms) else {
+                return false;
+            };
+            state.cursor_ms = Some(position);
+            state.timeline = None;
+            state.phase = PlaybackPhase::Paused;
+            state.resume_from_cursor = true;
+            state.generation = state.generation.wrapping_add(1);
+            state.player.take()
         };
-        self.cursor_ms.store(position, Ordering::SeqCst);
-        self.has_cursor.store(true, Ordering::SeqCst);
-        self.has_timeline.store(false, Ordering::SeqCst);
-        self.rendering.store(false, Ordering::SeqCst);
-        self.paused.store(true, Ordering::SeqCst);
-        self.resume_from_cursor.store(true, Ordering::SeqCst);
-        self.playing.store(false, Ordering::SeqCst);
-        self.generation.fetch_add(1, Ordering::SeqCst);
-        if let Some(player) = self.player.lock().unwrap().take() {
+        if let Some(player) = player {
             player.stop();
         }
         true
     }
 
     pub(crate) fn stop(&self, now_ms: u64) {
-        if let Some(position) = self.position(now_ms).or_else(|| self.cursor()) {
-            self.cursor_ms.store(position, Ordering::SeqCst);
-            self.has_cursor.store(true, Ordering::SeqCst);
-        }
-        self.has_timeline.store(false, Ordering::SeqCst);
-        self.rendering.store(false, Ordering::SeqCst);
-        self.paused.store(false, Ordering::SeqCst);
-        self.resume_from_cursor.store(false, Ordering::SeqCst);
-        self.playing.store(false, Ordering::SeqCst);
-        self.generation.fetch_add(1, Ordering::SeqCst);
-        if let Some(player) = self.player.lock().unwrap().take() {
+        let player = {
+            let mut state = self.state.lock().unwrap();
+            if let Some(position) = Self::position_locked(&state, now_ms).or(state.cursor_ms) {
+                state.cursor_ms = Some(position);
+            }
+            state.timeline = None;
+            state.phase = PlaybackPhase::Idle;
+            state.resume_from_cursor = false;
+            state.generation = state.generation.wrapping_add(1);
+            state.player.take()
+        };
+        if let Some(player) = player {
             player.stop();
         }
     }
 
     pub(crate) fn seek(&self, position_ms: u64) -> bool {
-        let was_playing = self.is_playing();
-        self.cursor_ms.store(position_ms, Ordering::SeqCst);
-        self.has_cursor.store(true, Ordering::SeqCst);
-        self.has_timeline.store(false, Ordering::SeqCst);
-        self.rendering.store(false, Ordering::SeqCst);
-        self.resume_from_cursor.store(true, Ordering::SeqCst);
-        self.playing.store(false, Ordering::SeqCst);
-        self.generation.fetch_add(1, Ordering::SeqCst);
-        if let Some(player) = self.player.lock().unwrap().take() {
+        let (was_playing, player) = {
+            let mut state = self.state.lock().unwrap();
+            let was_playing = state.phase == PlaybackPhase::Playing;
+            let was_paused = state.phase == PlaybackPhase::Paused;
+            state.cursor_ms = Some(position_ms);
+            state.timeline = None;
+            state.phase = if was_paused {
+                PlaybackPhase::Paused
+            } else {
+                PlaybackPhase::Idle
+            };
+            state.resume_from_cursor = true;
+            state.generation = state.generation.wrapping_add(1);
+            (was_playing, state.player.take())
+        };
+        if let Some(player) = player {
             player.stop();
         }
         was_playing
     }
 
     pub(crate) fn reset(&self) {
-        self.stop(0);
-        self.has_cursor.store(false, Ordering::SeqCst);
+        let player = {
+            let mut state = self.state.lock().unwrap();
+            state.generation = state.generation.wrapping_add(1);
+            state.phase = PlaybackPhase::Idle;
+            state.cursor_ms = None;
+            state.resume_from_cursor = false;
+            state.timeline = None;
+            state.player.take()
+        };
+        if let Some(player) = player {
+            player.stop();
+        }
     }
 
     pub(crate) fn is_active(&self, generation: u64) -> bool {
-        self.generation.load(Ordering::SeqCst) == generation
+        let state = self.state.lock().unwrap();
+        Self::is_active_locked(&state, generation)
+    }
+
+    fn is_active_locked(state: &PlaybackState, generation: u64) -> bool {
+        state.generation == generation
+            && matches!(
+                state.phase,
+                PlaybackPhase::Rendering | PlaybackPhase::Playing
+            )
     }
 
     pub(crate) fn is_playing(&self) -> bool {
-        self.playing.load(Ordering::SeqCst)
+        self.state.lock().unwrap().phase == PlaybackPhase::Playing
     }
 
     pub(crate) fn is_rendering(&self) -> bool {
-        self.rendering.load(Ordering::SeqCst)
+        self.state.lock().unwrap().phase == PlaybackPhase::Rendering
     }
 
     pub(crate) fn is_paused(&self) -> bool {
-        self.paused.load(Ordering::SeqCst)
+        self.state.lock().unwrap().phase == PlaybackPhase::Paused
     }
 
     pub(crate) fn cursor(&self) -> Option<u64> {
-        self.has_cursor
-            .load(Ordering::SeqCst)
-            .then(|| self.cursor_ms.load(Ordering::SeqCst))
+        self.state.lock().unwrap().cursor_ms
     }
 
     pub(crate) fn playback_start(&self) -> Option<u64> {
-        self.resume_from_cursor
-            .load(Ordering::SeqCst)
-            .then(|| self.cursor())
+        let state = self.state.lock().unwrap();
+        state
+            .resume_from_cursor
+            .then_some(state.cursor_ms)
             .flatten()
     }
 
@@ -139,50 +182,66 @@ impl PlaybackControl {
         musical_start_ms: u64,
         musical_end_ms: u64,
     ) {
-        if self.is_active(generation) {
-            self.wall_start_ms.store(wall_start_ms, Ordering::SeqCst);
-            self.musical_start_ms
-                .store(musical_start_ms, Ordering::SeqCst);
-            self.musical_end_ms.store(musical_end_ms, Ordering::SeqCst);
-            self.has_timeline.store(true, Ordering::SeqCst);
+        let mut state = self.state.lock().unwrap();
+        if Self::is_active_locked(&state, generation) {
+            state.timeline = Some(PlaybackTimeline {
+                wall_start_ms,
+                musical_start_ms,
+                musical_end_ms,
+            });
         }
     }
 
     pub(crate) fn position(&self, now_ms: u64) -> Option<u64> {
-        if !self.is_playing() || !self.has_timeline.load(Ordering::SeqCst) {
+        Self::position_locked(&self.state.lock().unwrap(), now_ms)
+    }
+
+    fn position_locked(state: &PlaybackState, now_ms: u64) -> Option<u64> {
+        if state.phase != PlaybackPhase::Playing {
             return None;
         }
+        let timeline = state.timeline?;
         Some(
-            (self.musical_start_ms.load(Ordering::SeqCst)
-                + now_ms.saturating_sub(self.wall_start_ms.load(Ordering::SeqCst)))
-            .min(self.musical_end_ms.load(Ordering::SeqCst)),
+            (timeline.musical_start_ms + now_ms.saturating_sub(timeline.wall_start_ms))
+                .min(timeline.musical_end_ms),
         )
     }
 
     pub(crate) fn set_player(&self, generation: u64, player: Arc<Player>) {
-        let mut current = self.player.lock().unwrap();
-        if self.is_active(generation) {
-            *current = Some(player);
-        } else {
+        let stale = {
+            let mut state = self.state.lock().unwrap();
+            if Self::is_active_locked(&state, generation) {
+                state.player = Some(player.clone());
+                false
+            } else {
+                true
+            }
+        };
+        if stale {
             player.stop();
         }
     }
 
     pub(crate) fn finish(&self, generation: u64) {
-        let mut current = self.player.lock().unwrap();
-        if self.is_active(generation) {
-            self.has_timeline.store(false, Ordering::SeqCst);
-            self.has_cursor.store(false, Ordering::SeqCst);
-            self.rendering.store(false, Ordering::SeqCst);
-            self.paused.store(false, Ordering::SeqCst);
-            self.resume_from_cursor.store(false, Ordering::SeqCst);
-            self.playing.store(false, Ordering::SeqCst);
-            current.take();
+        let mut state = self.state.lock().unwrap();
+        if state.generation == generation {
+            state.phase = PlaybackPhase::Idle;
+            state.cursor_ms = None;
+            state.resume_from_cursor = false;
+            state.timeline = None;
+            state.player.take();
         }
     }
 }
 
 pub(crate) type MidiEvent = (u64, bool, u8, u8);
+
+#[derive(Debug, PartialEq)]
+#[must_use]
+pub(crate) enum GeneratedUpdate {
+    Stale,
+    Applied(Option<u64>),
+}
 
 const SAMPLE_RATE: u32 = 48_000;
 const MAX_PLAYBACK_MS: u64 = 5 * 60 * 1_000;
@@ -373,8 +432,9 @@ pub(crate) fn add_generated(
     generated: Vec<(u8, u64, u64, u8)>,
     bpm: f64,
     musical_start_ms: Option<u64>,
+    revision: u64,
     shared: Arc<Mutex<Shared>>,
-) -> Option<u64> {
+) -> GeneratedUpdate {
     let step_ms = 60_000.0 / bpm / 24.0;
     let musical_base = musical_start_ms.unwrap_or_else(|| {
         shared
@@ -390,7 +450,7 @@ pub(crate) fn add_generated(
     let mut onset = musical_base;
     let mut notes: Vec<Note> = Vec::new();
     for (pitch, delta, duration, velocity) in generated {
-        onset += (delta as f64 * step_ms).round() as u64;
+        onset = onset.saturating_add((delta as f64 * step_ms).round() as u64);
         let duration_ms = (duration as f64 * step_ms).round().max(1.0) as u64;
         if let Some(previous) = notes.iter_mut().rev().find(|note| note.pitch == pitch)
             && previous.onset_ms + previous.duration_ms > onset
@@ -408,6 +468,9 @@ pub(crate) fn add_generated(
     let count = notes.len();
     let generated_start_ms = notes.first().map(|note| note.onset_ms);
     let mut state = shared.lock().unwrap();
+    if !state.generation_is_current(revision) {
+        return GeneratedUpdate::Stale;
+    }
     for note in state.notes.iter_mut().filter(|note| note.generated) {
         if note.onset_ms < musical_base && note.onset_ms + note.duration_ms > musical_base {
             note.duration_ms = musical_base - note.onset_ms;
@@ -422,5 +485,5 @@ pub(crate) fn add_generated(
     } else {
         format!("Generated {count} notes. Click Play to render them.")
     };
-    generated_start_ms
+    GeneratedUpdate::Applied(generated_start_ms)
 }

@@ -8,6 +8,7 @@ pub(crate) struct GenerationRequest {
     pub(crate) prompt: String,
     pub(crate) bpm: f64,
     pub(crate) musical_start_ms: Option<u64>,
+    pub(crate) revision: u64,
     pub(crate) auto_play: bool,
     pub(crate) soundfont: Option<PathBuf>,
 }
@@ -78,23 +79,35 @@ impl ModelProcess {
         if kind != "notes" {
             return Err(body.to_string());
         }
-        if body.is_empty() {
-            return Ok(Vec::new());
-        }
-        body.split(';')
-            .map(|note| {
-                let values = note
-                    .split(',')
-                    .map(str::parse::<u64>)
-                    .collect::<Result<Vec<_>, _>>()
-                    .map_err(|error| error.to_string())?;
-                if values.len() != 4 {
-                    return Err("invalid model note".to_string());
-                }
-                Ok((values[0] as u8, values[1], values[2], values[3] as u8))
-            })
-            .collect()
+        parse_generated_notes(body)
     }
+}
+
+pub(crate) fn parse_generated_notes(body: &str) -> Result<Vec<(u8, u64, u64, u8)>, String> {
+    if body.is_empty() {
+        return Ok(Vec::new());
+    }
+    body.split(';')
+        .map(|note| {
+            let values = note
+                .split(',')
+                .map(str::parse::<u64>)
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| error.to_string())?;
+            if values.len() != 4 {
+                return Err("invalid model note".to_string());
+            }
+            let pitch = u8::try_from(values[0])
+                .ok()
+                .filter(|value| *value <= 127)
+                .ok_or("model pitch is outside 0..127")?;
+            let velocity = u8::try_from(values[3])
+                .ok()
+                .filter(|value| *value <= 127)
+                .ok_or("model velocity is outside 0..127")?;
+            Ok((pitch, values[1], values[2], velocity))
+        })
+        .collect()
 }
 
 /// Absolute path to the repo root, so `uv --directory midilm` and model paths

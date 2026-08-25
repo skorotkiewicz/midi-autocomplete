@@ -1,5 +1,6 @@
 use crate::state::{Note, Shared};
 use midir::{Ignore, MidiInput, MidiInputConnection, MidiOutput, MidiOutputConnection};
+use midly::{MidiMessage, live::LiveEvent};
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
@@ -27,7 +28,7 @@ impl Capture {
 
     fn finish(&mut self, pitch: u8, end_ms: u64, shared: &Arc<Mutex<Shared>>) {
         if let Some(note) = self.held[pitch as usize].take() {
-            shared.lock().unwrap().notes.push(Note {
+            shared.lock().unwrap().add_input_note(Note {
                 pitch,
                 onset_ms: note.onset_ms,
                 duration_ms: end_ms.saturating_sub(note.onset_ms).max(1),
@@ -37,22 +38,23 @@ impl Capture {
         }
     }
 
-    fn receive(&mut self, message: &[u8], now_ms: u64, shared: &Arc<Mutex<Shared>>) -> bool {
-        if message.len() < 3 {
+    fn receive(&mut self, bytes: &[u8], now_ms: u64, shared: &Arc<Mutex<Shared>>) -> bool {
+        let Ok(LiveEvent::Midi { message, .. }) = LiveEvent::parse(bytes) else {
             return false;
-        }
+        };
         // ponytail: piano input treats all MIDI channels as one; split by channel if multi-instrument input matters.
-        match message[0] & 0xf0 {
-            0x90 if message[2] > 0 => {
-                self.finish(message[1], now_ms, shared);
-                self.held[message[1] as usize] = Some(HeldNote {
+        match message {
+            MidiMessage::NoteOn { key, vel } if vel.as_int() > 0 => {
+                let pitch = key.as_int();
+                self.finish(pitch, now_ms, shared);
+                self.held[pitch as usize] = Some(HeldNote {
                     onset_ms: now_ms,
-                    velocity: message[2],
+                    velocity: vel.as_int(),
                     released: false,
                 });
             }
-            0x80 | 0x90 => {
-                let pitch = message[1];
+            MidiMessage::NoteOff { key, .. } | MidiMessage::NoteOn { key, .. } => {
+                let pitch = key.as_int();
                 if self.sustain {
                     if let Some(note) = self.held[pitch as usize].as_mut() {
                         note.released = true;
@@ -61,9 +63,9 @@ impl Capture {
                     self.finish(pitch, now_ms, shared);
                 }
             }
-            0xb0 if message[1] == 64 => {
+            MidiMessage::Controller { controller, value } if controller.as_int() == 64 => {
                 let was_down = self.sustain;
-                self.sustain = message[2] >= 64;
+                self.sustain = value.as_int() >= 64;
                 if was_down && !self.sustain {
                     for pitch in 0..128 {
                         if self.held[pitch].is_some_and(|note| note.released) {
