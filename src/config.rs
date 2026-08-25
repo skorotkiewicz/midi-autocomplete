@@ -3,6 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 pub(crate) const DEFAULT_AUTO_PAUSE_MS: u64 = 800;
+pub(crate) const DEFAULT_BPM: f64 = 120.0;
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(default)]
@@ -12,6 +13,7 @@ pub(crate) struct AppConfig {
     pub(crate) model: Option<String>,
     pub(crate) soundfont: Option<String>,
     pub(crate) auto_pause_ms: u64,
+    pub(crate) bpm: f64,
 }
 
 impl Default for AppConfig {
@@ -22,6 +24,7 @@ impl Default for AppConfig {
             model: None,
             soundfont: None,
             auto_pause_ms: DEFAULT_AUTO_PAUSE_MS,
+            bpm: DEFAULT_BPM,
         }
     }
 }

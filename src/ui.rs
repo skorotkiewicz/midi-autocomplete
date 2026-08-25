@@ -207,13 +207,14 @@ pub(crate) fn build_ui(app: &Application) {
         .build();
     let auto_pause = SpinButton::with_range(200.0, 3_000.0, 100.0);
     auto_pause.set_value(initial_config.auto_pause_ms as f64);
-    let config = Arc::new(Mutex::new(initial_config));
     let model_browse = Button::with_label("Browse");
     let bpm = SpinButton::new(
         Some(&Adjustment::new(120.0, 30.0, 300.0, 1.0, 10.0, 0.0)),
         1.0,
         0,
     );
+    bpm.set_value(initial_config.bpm);
+    let config = Arc::new(Mutex::new(initial_config));
     let status = Label::new(None);
     status.set_xalign(0.0);
     let roll = DrawingArea::builder()
@@ -289,6 +290,20 @@ pub(crate) fn build_ui(app: &Application) {
         };
         if let Err(error) = save_config(&path_for_auto_pause, &snapshot) {
             state_for_auto_pause.lock().unwrap().status = error;
+        }
+    });
+
+    let config_for_bpm = config.clone();
+    let path_for_bpm = config_path.clone();
+    let state_for_bpm = shared.clone();
+    bpm.connect_value_changed(move |input| {
+        let snapshot = {
+            let mut config = config_for_bpm.lock().unwrap();
+            config.bpm = input.value();
+            config.clone()
+        };
+        if let Err(error) = save_config(&path_for_bpm, &snapshot) {
+            state_for_bpm.lock().unwrap().status = error;
         }
     });
 

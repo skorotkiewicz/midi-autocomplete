@@ -30,6 +30,7 @@ fn config_round_trips() {
         model: Some("/models/medium.pt".into()),
         soundfont: Some("/sounds/piano.sf2".into()),
         auto_pause_ms: 1_200,
+        bpm: 96.0,
     };
     save_config(&path, &expected).unwrap();
     assert_eq!(load_config(&path).unwrap(), expected);
