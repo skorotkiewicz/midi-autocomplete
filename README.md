@@ -32,7 +32,7 @@ Play renders the SoundFont through the computer's default audio device and sends
 
 ## Configuration
 
-The app saves the MIDI device selections, model checkpoint, SoundFont path, BPM, and Auto delay automatically. On startup it restores them and reconnects when both saved MIDI devices are available. If no model is saved, it uses `midilm/checkpoints/medium.pt`.
+The app saves the MIDI device selections, model checkpoint, SoundFont path, BPM, and Auto wait time automatically. On startup it restores them and reconnects when both saved MIDI devices are available. If no model is saved, it uses `midilm/checkpoints/medium.pt`.
 
 ```text
 ~/.config/midi-autocomplete/config.toml
