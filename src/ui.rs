@@ -1,7 +1,8 @@
 use crate::config::{AppConfig, config_path, load_config, save_config};
 use crate::midi::{connect_devices, midi_inputs, midi_outputs, silence_output};
+use crate::midi_file::{export_midi, import_midi};
 use crate::model::{GenerationRequest, ModelProcess, prompt, resolve_model_path};
-use crate::playback::{PlaybackControl, add_generated, replay};
+use crate::playback::{GeneratedUpdate, PlaybackControl, add_generated, replay};
 use crate::state::Shared;
 use crate::timeline::{
     PIXELS_PER_MS, draw_playhead, draw_roll, scroll_for_playhead, timeline_bounds,
@@ -10,9 +11,10 @@ use crate::timeline::{
 use gtk4::glib;
 use gtk4::prelude::*;
 use gtk4::{
-    Adjustment, Application, ApplicationWindow, Box as GtkBox, Button, DrawingArea, DropDown,
-    Entry, FileChooserAction, FileChooserNative, FileFilter, GestureClick, Label, Orientation,
-    Overlay, PolicyType, ResponseType, ScrolledWindow, SpinButton, ToggleButton,
+    Adjustment, Application, ApplicationWindow, Box as GtkBox, Button, CheckButton, DrawingArea,
+    DropDown, Entry, FileChooserAction, FileChooserNative, FileFilter, GestureClick, HeaderBar,
+    Label, MenuButton, Orientation, Overlay, PolicyType, Popover, ResponseType, ScrolledWindow,
+    SpinButton,
 };
 use midir::{MidiInputConnection, MidiOutputConnection};
 use std::cell::RefCell;
@@ -23,18 +25,19 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
-const AUTO_PAUSE_MS: u64 = 800;
-
 pub(crate) fn auto_generation_due(
     now_ms: u64,
     last_input_ms: u64,
+    auto_delay_ms: u64,
+    capture_has_input: bool,
     input_active: bool,
     input_notes: usize,
     requested_notes: usize,
 ) -> bool {
-    !input_active
+    capture_has_input
+        && !input_active
         && input_notes > requested_notes
-        && now_ms.saturating_sub(last_input_ms) >= AUTO_PAUSE_MS
+        && now_ms.saturating_sub(last_input_ms) >= auto_delay_ms
 }
 
 pub(crate) fn preferred_index(names: &[String], preferred: Option<&str>) -> Option<u32> {
@@ -81,6 +84,7 @@ struct GenerationControls {
     config: Arc<Mutex<AppConfig>>,
     config_path: PathBuf,
     requests: mpsc::Sender<GenerationRequest>,
+    generation_busy: Arc<AtomicBool>,
     started: Instant,
 }
 
@@ -90,15 +94,24 @@ impl GenerationControls {
             .playback
             .position(self.started.elapsed().as_millis() as u64)
             .or_else(|| self.playback.cursor());
-        let prompt_text = {
-            let state = self.shared.lock().unwrap();
-            prompt(&state.notes, self.bpm.value(), musical_start_ms)
+        let (prompt_text, revision) = {
+            let mut state = self.shared.lock().unwrap();
+            let prompt_text = prompt(&state.notes, self.bpm.value(), musical_start_ms);
+            if prompt_text.is_empty() && !allow_empty {
+                state.status = "Play at least one complete note before this position".into();
+                return false;
+            }
+            if self
+                .generation_busy
+                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                .is_err()
+            {
+                state.status = "Generation is already in progress".into();
+                return false;
+            }
+            let revision = state.invalidate_generation();
+            (prompt_text, revision)
         };
-        if prompt_text.is_empty() && !allow_empty {
-            self.shared.lock().unwrap().status =
-                "Play at least one complete note before this position".into();
-            return false;
-        }
 
         let model_path = self.model.text().to_string();
         let soundfont_path = PathBuf::from(self.soundfont.text().as_str());
@@ -112,6 +125,7 @@ impl GenerationControls {
             config.clone()
         };
         if let Err(error) = save_config(&self.config_path, &snapshot) {
+            self.generation_busy.store(false, Ordering::SeqCst);
             self.shared.lock().unwrap().status = error;
             return false;
         }
@@ -122,10 +136,12 @@ impl GenerationControls {
             prompt: prompt_text,
             bpm: self.bpm.value(),
             musical_start_ms,
+            revision,
             auto_play,
             soundfont: soundfont_path,
         };
         if self.requests.send(request).is_err() {
+            self.generation_busy.store(false, Ordering::SeqCst);
             self.shared.lock().unwrap().status = "Model worker stopped".into();
             return false;
         }
@@ -146,7 +162,7 @@ pub(crate) fn build_ui(app: &Application) {
     }));
     let output: Arc<Mutex<Option<MidiOutputConnection>>> = Arc::new(Mutex::new(None));
     let playback_control = Arc::new(PlaybackControl::default());
-    let auto_busy = Arc::new(AtomicBool::new(false));
+    let generation_busy = Arc::new(AtomicBool::new(false));
     let auto_resume = Arc::new(AtomicBool::new(false));
     let input_connection: Rc<RefCell<Option<MidiInputConnection<()>>>> =
         Rc::new(RefCell::new(None));
@@ -158,17 +174,21 @@ pub(crate) fn build_ui(app: &Application) {
     let refresh = Button::with_label("Refresh");
     let record = Button::with_label("Rec");
     let clear = Button::with_label("Clear");
-    let auto_mode = ToggleButton::with_label("Auto");
-    let explicit_mode = ToggleButton::with_label("Explicit");
+    let import_midi_button = Button::with_label("Import MIDI");
+    let export_midi_button = Button::with_label("Export MIDI");
+    let quit = Button::with_label("Quit");
+    let auto_mode = CheckButton::with_label("Auto");
+    let explicit_mode = CheckButton::with_label("Explicit");
     explicit_mode.set_group(Some(&auto_mode));
     auto_mode.set_active(true);
-    let generate = Button::with_label("Autocomplete");
-    generate.set_visible(false);
+    let generate = Button::builder()
+        .label("Autocomplete")
+        .sensitive(false)
+        .tooltip_text("Available in Explicit mode")
+        .build();
     let play = Button::with_label("Play");
     let pause = Button::with_label("Pause");
     let stop = Button::with_label("Stop");
-    pause.set_visible(false);
-    stop.set_visible(false);
     let browse = Button::with_label("Browse");
     let soundfont = Entry::builder()
         .placeholder_text("Select a .sf2 SoundFont")
@@ -186,13 +206,16 @@ pub(crate) fn build_ui(app: &Application) {
         )
         .hexpand(true)
         .build();
-    let config = Arc::new(Mutex::new(initial_config));
+    let auto_delay = SpinButton::with_range(200.0, 3_000.0, 100.0);
+    auto_delay.set_value(initial_config.auto_pause_ms as f64);
     let model_browse = Button::with_label("Browse");
     let bpm = SpinButton::new(
         Some(&Adjustment::new(120.0, 30.0, 300.0, 1.0, 10.0, 0.0)),
         1.0,
         0,
     );
+    bpm.set_value(initial_config.bpm);
+    let config = Arc::new(Mutex::new(initial_config));
     let status = Label::new(None);
     status.set_xalign(0.0);
     let roll = DrawingArea::builder()
@@ -254,6 +277,34 @@ pub(crate) fn build_ui(app: &Application) {
         };
         if let Err(error) = save_config(&path_for_input, &snapshot) {
             state_for_input.lock().unwrap().status = error;
+        }
+    });
+
+    let config_for_auto_delay = config.clone();
+    let path_for_auto_delay = config_path.clone();
+    let state_for_auto_delay = shared.clone();
+    auto_delay.connect_value_changed(move |input| {
+        let snapshot = {
+            let mut config = config_for_auto_delay.lock().unwrap();
+            config.auto_pause_ms = input.value_as_int() as u64;
+            config.clone()
+        };
+        if let Err(error) = save_config(&path_for_auto_delay, &snapshot) {
+            state_for_auto_delay.lock().unwrap().status = error;
+        }
+    });
+
+    let config_for_bpm = config.clone();
+    let path_for_bpm = config_path.clone();
+    let state_for_bpm = shared.clone();
+    bpm.connect_value_changed(move |input| {
+        let snapshot = {
+            let mut config = config_for_bpm.lock().unwrap();
+            config.bpm = input.value();
+            config.clone()
+        };
+        if let Err(error) = save_config(&path_for_bpm, &snapshot) {
+            state_for_bpm.lock().unwrap().status = error;
         }
     });
 
@@ -392,6 +443,85 @@ pub(crate) fn build_ui(app: &Application) {
             .clear_timeline(started.elapsed().as_millis() as u64)
     });
 
+    let state_for_import = shared.clone();
+    let playback_for_import = playback_control.clone();
+    let auto_resume_for_import = auto_resume.clone();
+    let bpm_for_import = bpm.clone();
+    import_midi_button.connect_clicked(move |_| {
+        let chooser = FileChooserNative::builder()
+            .title("Import MIDI")
+            .action(FileChooserAction::Open)
+            .accept_label("Import")
+            .build();
+        let filter = FileFilter::new();
+        filter.set_name(Some("MIDI files"));
+        filter.add_pattern("*.mid");
+        filter.add_pattern("*.midi");
+        filter.add_pattern("*.MID");
+        chooser.set_filter(&filter);
+        let state = state_for_import.clone();
+        let playback = playback_for_import.clone();
+        let auto_resume = auto_resume_for_import.clone();
+        let bpm = bpm_for_import.clone();
+        chooser.connect_response(move |chooser, response| {
+            if response != ResponseType::Accept {
+                return;
+            }
+            let Some(path) = chooser.file().and_then(|file| file.path()) else {
+                return;
+            };
+            match import_midi(&path) {
+                Ok(imported) => {
+                    let count = imported.notes.len();
+                    auto_resume.store(false, Ordering::SeqCst);
+                    playback.reset();
+                    bpm.set_value(imported.bpm);
+                    let mut state = state.lock().unwrap();
+                    state.replace_notes(imported.notes, started.elapsed().as_millis() as u64);
+                    state.status = format!("Imported {count} notes from {}", path.display());
+                }
+                Err(error) => state.lock().unwrap().status = error,
+            }
+        });
+        chooser.show();
+    });
+
+    let state_for_export = shared.clone();
+    let bpm_for_export = bpm.clone();
+    export_midi_button.connect_clicked(move |_| {
+        let notes = state_for_export.lock().unwrap().notes.clone();
+        if notes.is_empty() {
+            state_for_export.lock().unwrap().status = "Nothing to export".into();
+            return;
+        }
+        let bpm = bpm_for_export.value();
+        let chooser = FileChooserNative::builder()
+            .title("Export MIDI")
+            .action(FileChooserAction::Save)
+            .accept_label("Export")
+            .build();
+        chooser.set_current_name("midi-autocomplete.mid");
+        let filter = FileFilter::new();
+        filter.set_name(Some("MIDI files"));
+        filter.add_pattern("*.mid");
+        chooser.set_filter(&filter);
+        let state = state_for_export.clone();
+        chooser.connect_response(move |chooser, response| {
+            if response != ResponseType::Accept {
+                return;
+            }
+            let Some(path) = chooser.file().and_then(|file| file.path()) else {
+                return;
+            };
+            let status = match export_midi(&path, &notes, bpm) {
+                Ok(()) => format!("Exported {} notes to {}", notes.len(), path.display()),
+                Err(error) => error,
+            };
+            state.lock().unwrap().status = status;
+        });
+        chooser.show();
+    });
+
     let soundfont_for_browse = soundfont.clone();
     let config_for_browse = config.clone();
     let path_for_browse = config_path.clone();
@@ -471,10 +601,15 @@ pub(crate) fn build_ui(app: &Application) {
     let state_for_play = shared.clone();
     let output_for_play = output.clone();
     let playback_for_play = playback_control.clone();
+    let generation_busy_for_play = generation_busy.clone();
     let soundfont_for_play = soundfont.clone();
     let config_for_play = config.clone();
     let path_for_play = config_path.clone();
     play.connect_clicked(move |_| {
+        if generation_busy_for_play.load(Ordering::SeqCst) {
+            state_for_play.lock().unwrap().status = "Wait for generation to finish".into();
+            return;
+        }
         if playback_for_play.is_rendering() {
             state_for_play.lock().unwrap().status = "SoundFont is still rendering...".into();
             return;
@@ -514,7 +649,9 @@ pub(crate) fn build_ui(app: &Application) {
     let playback_for_pause = playback_control.clone();
     pause.connect_clicked(move |_| {
         if playback_for_pause.pause(started.elapsed().as_millis() as u64) {
-            state_for_pause.lock().unwrap().status = "Paused".into();
+            let mut state = state_for_pause.lock().unwrap();
+            state.invalidate_generation();
+            state.status = "Paused".into();
         }
     });
 
@@ -524,7 +661,9 @@ pub(crate) fn build_ui(app: &Application) {
     stop.connect_clicked(move |_| {
         auto_resume_for_stop.store(false, Ordering::SeqCst);
         playback_for_stop.stop(started.elapsed().as_millis() as u64);
-        state_for_stop.lock().unwrap().status = "Stopped".into();
+        let mut state = state_for_stop.lock().unwrap();
+        state.invalidate_generation();
+        state.status = "Stopped".into();
     });
 
     let seek = GestureClick::new();
@@ -533,15 +672,21 @@ pub(crate) fn build_ui(app: &Application) {
     let playback_for_seek = playback_control.clone();
     let soundfont_for_seek = soundfont.clone();
     let timeline_for_seek = timeline.clone();
+    let auto_resume_for_seek = auto_resume.clone();
     seek.connect_pressed(move |_, _, x, _| {
         let now = started.elapsed().as_millis() as u64;
+        auto_resume_for_seek.store(false, Ordering::SeqCst);
         let (notes, bounds) = {
-            let state = state_for_seek.lock().unwrap();
+            let mut state = state_for_seek.lock().unwrap();
             let playhead = playback_for_seek
                 .position(now)
                 .or_else(|| playback_for_seek.cursor())
                 .or_else(|| state.capturing.then(|| state.capture_position(now)));
-            (state.notes.clone(), timeline_bounds(&state.notes, playhead))
+            let bounds = timeline_bounds(&state.notes, playhead);
+            if state.capturing {
+                state.toggle_capture(now, None);
+            }
+            (state.notes.clone(), bounds)
         };
         let Some((start, end)) = bounds else {
             return;
@@ -555,8 +700,10 @@ pub(crate) fn build_ui(app: &Application) {
                 timeline_for_seek.width().max(1) as f64,
             ));
         let was_playing = playback_for_seek.seek(position);
-        state_for_seek.lock().unwrap().status =
-            format!("Position: {:.2}s", position as f64 / 1_000.0);
+        let mut state = state_for_seek.lock().unwrap();
+        state.invalidate_generation();
+        state.status = format!("Position: {:.2}s", position as f64 / 1_000.0);
+        drop(state);
         if !was_playing {
             return;
         }
@@ -587,15 +734,24 @@ pub(crate) fn build_ui(app: &Application) {
         config: config.clone(),
         config_path: config_path.clone(),
         requests: requests.clone(),
+        generation_busy: generation_busy.clone(),
         started,
     };
     let worker_state = shared.clone();
     let worker_output = output.clone();
     let worker_playback = playback_control.clone();
-    let worker_auto_busy = auto_busy.clone();
+    let worker_generation_busy = generation_busy.clone();
     thread::spawn(move || {
         let mut process: Option<ModelProcess> = None;
         while let Ok(request) = receiver.recv() {
+            if !worker_state
+                .lock()
+                .unwrap()
+                .generation_is_current(request.revision)
+            {
+                worker_generation_busy.store(false, Ordering::SeqCst);
+                continue;
+            }
             let restart = process.as_ref().is_none_or(|current| {
                 current.checkpoint != resolve_model_path(&request.checkpoint)
             });
@@ -603,47 +759,69 @@ pub(crate) fn build_ui(app: &Application) {
                 process = match ModelProcess::start(&request.checkpoint) {
                     Ok(model) => Some(model),
                     Err(error) => {
-                        worker_state.lock().unwrap().status = error;
-                        if request.auto_play {
-                            worker_auto_busy.store(false, Ordering::SeqCst);
+                        let mut state = worker_state.lock().unwrap();
+                        if state.generation_is_current(request.revision) {
+                            state.status = error;
                         }
+                        worker_generation_busy.store(false, Ordering::SeqCst);
                         continue;
                     }
                 };
             }
-            worker_state.lock().unwrap().status = "Generating...".into();
+            {
+                let mut state = worker_state.lock().unwrap();
+                if !state.generation_is_current(request.revision) {
+                    worker_generation_busy.store(false, Ordering::SeqCst);
+                    continue;
+                }
+                state.status = "Generating...".into();
+            }
             match process.as_mut().unwrap().generate(&request.prompt) {
                 Ok(notes) => {
-                    let generated_start_ms = add_generated(
+                    let update = add_generated(
                         notes,
                         request.bpm,
                         request.musical_start_ms,
+                        request.revision,
                         worker_state.clone(),
                     );
-                    if request.auto_play
-                        && let (Some(start), Some(soundfont)) =
-                            (generated_start_ms, request.soundfont)
-                    {
-                        let notes = worker_state.lock().unwrap().notes.clone();
-                        replay(
-                            notes,
-                            soundfont,
-                            Some(start),
-                            started,
-                            worker_state.clone(),
-                            worker_output.clone(),
-                            worker_playback.clone(),
-                        );
+                    match update {
+                        GeneratedUpdate::Applied(Some(start)) if request.auto_play => {
+                            if let Some(soundfont) = request.soundfont {
+                                let notes = worker_state.lock().unwrap().notes.clone();
+                                replay(
+                                    notes,
+                                    soundfont,
+                                    Some(start),
+                                    started,
+                                    worker_state.clone(),
+                                    worker_output.clone(),
+                                    worker_playback.clone(),
+                                );
+                            }
+                        }
+                        GeneratedUpdate::Stale => {
+                            let mut state = worker_state.lock().unwrap();
+                            if state.status == "Generating..." {
+                                state.status = if state.capturing {
+                                    "Recording MIDI prompt...".into()
+                                } else {
+                                    "Ready".into()
+                                };
+                            }
+                        }
+                        GeneratedUpdate::Applied(_) => {}
                     }
                 }
                 Err(error) => {
-                    worker_state.lock().unwrap().status = error;
+                    let mut state = worker_state.lock().unwrap();
+                    if state.generation_is_current(request.revision) {
+                        state.status = error;
+                    }
                     process = None;
                 }
             }
-            if request.auto_play {
-                worker_auto_busy.store(false, Ordering::SeqCst);
-            }
+            worker_generation_busy.store(false, Ordering::SeqCst);
         }
     });
 
@@ -666,13 +844,14 @@ pub(crate) fn build_ui(app: &Application) {
     let record_for_timer = record.clone();
     let playback_for_timer = playback_control.clone();
     let auto_generation = generation_controls.clone();
-    let auto_busy_for_timer = auto_busy.clone();
+    let generation_busy_for_timer = generation_busy.clone();
     let auto_resume_for_timer = auto_resume.clone();
+    let auto_delay_for_timer = auto_delay.clone();
     let mut auto_requested_notes = 0;
     glib::timeout_add_local(Duration::from_millis(33), move || {
         let now = started.elapsed().as_millis() as u64;
         if auto_resume_for_timer.load(Ordering::SeqCst)
-            && !auto_busy_for_timer.load(Ordering::SeqCst)
+            && !generation_busy_for_timer.load(Ordering::SeqCst)
             && !playback_for_timer.is_rendering()
             && !playback_for_timer.is_playing()
             && !playback_for_timer.is_paused()
@@ -696,17 +875,18 @@ pub(crate) fn build_ui(app: &Application) {
                 && auto_generation_due(
                     now,
                     state.last_input_ms,
+                    auto_delay_for_timer.value_as_int() as u64,
+                    state.capture_has_input,
                     state.input_active,
                     input_notes,
                     auto_requested_notes,
                 )
-                && !auto_busy_for_timer.load(Ordering::SeqCst)
+                && !generation_busy_for_timer.load(Ordering::SeqCst)
                 && !playback_for_timer.is_rendering()
                 && !playback_for_timer.is_playing();
             if should_auto {
                 auto_requested_notes = input_notes;
                 state.toggle_capture(now, None);
-                auto_busy_for_timer.store(true, Ordering::SeqCst);
                 auto_resume_for_timer.store(true, Ordering::SeqCst);
             }
             let playhead = if playback_for_timer.is_playing() {
@@ -724,8 +904,8 @@ pub(crate) fn build_ui(app: &Application) {
             (playhead, bounds, should_auto, follow_playhead)
         };
 
-        if should_auto && !auto_generation.queue(false, true) {
-            auto_busy_for_timer.store(false, Ordering::SeqCst);
+        if should_auto {
+            auto_generation.queue(false, true);
         }
 
         let viewport = timeline_for_timer.width().max(1);
@@ -744,65 +924,126 @@ pub(crate) fn build_ui(app: &Application) {
         } else {
             "Rec"
         });
-        generate_for_timer.set_visible(explicit_mode_for_timer.is_active());
+        let generating = generation_busy_for_timer.load(Ordering::SeqCst);
+        let explicit = explicit_mode_for_timer.is_active();
+        generate_for_timer.set_sensitive(explicit && !generating);
+        generate_for_timer.set_tooltip_text(if explicit {
+            generating.then_some("Wait for generation to finish")
+        } else {
+            Some("Available in Explicit mode")
+        });
         let playing = playback_for_timer.is_playing();
         let paused = playback_for_timer.is_paused();
+        let rendering = playback_for_timer.is_rendering();
         play_for_timer.set_label(if paused { "Resume" } else { "Play" });
-        play_for_timer.set_visible(!playing);
-        play_for_timer.set_sensitive(!playback_for_timer.is_rendering());
-        pause_for_timer.set_visible(playing);
-        stop_for_timer.set_visible(playing || paused);
+        play_for_timer.set_sensitive(!playing && !rendering && !generating);
+        pause_for_timer.set_sensitive(playing);
+        stop_for_timer.set_sensitive(playing || paused || rendering);
         roll_for_timer.queue_draw();
         playhead_for_timer.queue_draw();
         glib::ControlFlow::Continue
     });
 
-    let devices = GtkBox::new(Orientation::Horizontal, 8);
-    devices.append(&Label::new(Some("Input")));
-    devices.append(&input_dropdown);
-    devices.append(&Label::new(Some("Output")));
-    devices.append(&output_dropdown);
-    devices.append(&connect);
-    devices.append(&refresh);
+    let file_box = GtkBox::new(Orientation::Vertical, 6);
+    file_box.set_margin_top(8);
+    file_box.set_margin_bottom(8);
+    file_box.set_margin_start(8);
+    file_box.set_margin_end(8);
+    file_box.append(&import_midi_button);
+    file_box.append(&export_midi_button);
+    file_box.append(&quit);
+    let file_popover = Popover::new();
+    file_popover.set_child(Some(&file_box));
+    let file_menu = MenuButton::builder().label("File").build();
+    file_menu.set_popover(Some(&file_popover));
 
-    let controls = GtkBox::new(Orientation::Horizontal, 8);
-    controls.append(&Label::new(Some("Model")));
-    controls.append(&model);
-    controls.append(&model_browse);
+    let settings = GtkBox::new(Orientation::Vertical, 6);
+    settings.set_width_request(460);
+    settings.set_margin_top(10);
+    settings.set_margin_bottom(10);
+    settings.set_margin_start(10);
+    settings.set_margin_end(10);
+    settings.append(&Label::builder().label("MIDI input").xalign(0.0).build());
+    settings.append(&input_dropdown);
+    settings.append(&Label::builder().label("MIDI output").xalign(0.0).build());
+    settings.append(&output_dropdown);
+    let device_actions = GtkBox::new(Orientation::Horizontal, 6);
+    device_actions.append(&connect);
+    device_actions.append(&refresh);
+    settings.append(&device_actions);
+    settings.append(
+        &Label::builder()
+            .label("Model checkpoint")
+            .xalign(0.0)
+            .build(),
+    );
+    let model_row = GtkBox::new(Orientation::Horizontal, 6);
+    model_row.append(&model);
+    model_row.append(&model_browse);
+    settings.append(&model_row);
+    settings.append(&Label::builder().label("SoundFont").xalign(0.0).build());
+    let soundfont_row = GtkBox::new(Orientation::Horizontal, 6);
+    soundfont_row.append(&soundfont);
+    soundfont_row.append(&browse);
+    settings.append(&soundfont_row);
+    settings.append(&Label::builder().label("BPM").xalign(0.0).build());
+    settings.append(&bpm);
+    settings.append(
+        &Label::builder()
+            .label("Wait after last note (ms)")
+            .tooltip_text("How long Auto waits after all notes are released before generating")
+            .xalign(0.0)
+            .build(),
+    );
+    settings.append(&auto_delay);
+    let settings_popover = Popover::new();
+    settings_popover.set_child(Some(&settings));
+    let settings_menu = MenuButton::builder()
+        .icon_name("preferences-system-symbolic")
+        .tooltip_text("Settings")
+        .build();
+    settings_menu.set_popover(Some(&settings_popover));
+
+    let header = HeaderBar::new();
+    header.set_title_widget(Some(&Label::new(Some("MIDI Autocomplete"))));
+    header.set_show_title_buttons(true);
+    header.pack_start(&file_menu);
+    header.pack_end(&settings_menu);
+
+    let controls = GtkBox::new(Orientation::Horizontal, 6);
+    controls.append(&record);
+    controls.append(&generate);
+    controls.append(&play);
+    controls.append(&pause);
+    controls.append(&stop);
+    controls.append(&clear);
     controls.append(&Label::new(Some("Mode")));
     controls.append(&auto_mode);
     controls.append(&explicit_mode);
-    controls.append(&Label::new(Some("BPM")));
-    controls.append(&bpm);
-    controls.append(&generate);
-    controls.append(&clear);
-
-    let playback = GtkBox::new(Orientation::Horizontal, 8);
-    playback.append(&Label::new(Some("SoundFont")));
-    playback.append(&soundfont);
-    playback.append(&browse);
-    playback.append(&record);
-    playback.append(&play);
-    playback.append(&pause);
-    playback.append(&stop);
 
     let content = GtkBox::new(Orientation::Vertical, 8);
     content.set_margin_top(12);
     content.set_margin_bottom(12);
     content.set_margin_start(12);
     content.set_margin_end(12);
-    content.append(&devices);
     content.append(&controls);
-    content.append(&playback);
     content.append(&timeline_overlay);
     content.append(&status);
 
-    ApplicationWindow::builder()
+    let app_for_quit = app.clone();
+    quit.connect_clicked(move |_| app_for_quit.quit());
+    let file_popover_for_import = file_popover.clone();
+    import_midi_button.connect_clicked(move |_| file_popover_for_import.popdown());
+    let file_popover_for_export = file_popover.clone();
+    export_midi_button.connect_clicked(move |_| file_popover_for_export.popdown());
+
+    let window = ApplicationWindow::builder()
         .application(app)
         .title("MIDI Autocomplete")
         .default_width(1000)
         .default_height(600)
         .child(&content)
-        .build()
-        .present();
+        .build();
+    window.set_titlebar(Some(&header));
+    window.present();
 }

@@ -1,14 +1,20 @@
 use crate::config::{AppConfig, config_path, load_config, save_config};
 use crate::midi::{connect_output, midi_inputs, midi_outputs};
-use crate::model::{prompt, repo_root, resolve_model_path};
+use crate::midi_file::{decode_midi, encode_midi};
+use crate::model::{parse_generated_notes, prompt, repo_root, resolve_model_path};
 use crate::playback::{
-    PlaybackControl, add_generated, render_soundfont, replay_events_from, send_midi_events,
+    GeneratedUpdate, PlaybackControl, add_generated, render_soundfont, replay_events_from,
+    send_midi_events,
 };
 use crate::state::{Note, Shared};
 use crate::timeline::{
     playhead_overlay_x, scroll_for_playhead, timeline_bounds, timeline_content_width,
 };
 use crate::ui::{auto_generation_due, preferred_index};
+use midly::{
+    Format, Header, MetaMessage, MidiMessage, Smf, Timing, TrackEvent, TrackEventKind,
+    num::{u4, u7, u15, u28},
+};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -23,6 +29,8 @@ fn config_round_trips() {
         midi_output: Some("Piano Out".into()),
         model: Some("/models/medium.pt".into()),
         soundfont: Some("/sounds/piano.sf2".into()),
+        auto_pause_ms: 1_200,
+        bpm: 96.0,
     };
     save_config(&path, &expected).unwrap();
     assert_eq!(load_config(&path).unwrap(), expected);
@@ -31,10 +39,13 @@ fn config_round_trips() {
 
 #[test]
 fn auto_generation_waits_for_a_complete_idle_pause() {
-    assert!(!auto_generation_due(799, 0, false, 1, 0));
-    assert!(!auto_generation_due(800, 0, true, 1, 0));
-    assert!(!auto_generation_due(800, 0, false, 1, 1));
-    assert!(auto_generation_due(800, 0, false, 1, 0));
+    assert!(!auto_generation_due(800, 0, 800, false, false, 1, 0));
+    assert!(!auto_generation_due(799, 0, 800, true, false, 1, 0));
+    assert!(!auto_generation_due(800, 0, 800, true, true, 1, 0));
+    assert!(!auto_generation_due(800, 0, 800, true, false, 1, 1));
+    assert!(auto_generation_due(800, 0, 800, true, false, 1, 0));
+    assert!(!auto_generation_due(1_199, 0, 1_200, true, false, 1, 0));
+    assert!(auto_generation_due(1_200, 0, 1_200, true, false, 1, 0));
 }
 
 #[test]
@@ -42,6 +53,100 @@ fn device_selection_follows_names_after_refresh() {
     let names = vec!["Other".to_string(), "Piano".to_string()];
     assert_eq!(preferred_index(&names, Some("Piano")), Some(1));
     assert_eq!(preferred_index(&names, Some("Missing")), None);
+}
+
+#[test]
+fn midi_file_round_trips_timeline_notes() {
+    let bytes = encode_midi(
+        &[Note {
+            pitch: 60,
+            onset_ms: 500,
+            duration_ms: 250,
+            velocity: 80,
+            generated: true,
+        }],
+        120.0,
+    )
+    .unwrap();
+    let imported = decode_midi(&bytes).unwrap();
+
+    assert_eq!(imported.bpm, 120.0);
+    assert_eq!(imported.notes.len(), 1);
+    assert_eq!(imported.notes[0].pitch, 60);
+    assert_eq!(imported.notes[0].onset_ms, 500);
+    assert_eq!(imported.notes[0].duration_ms, 250);
+    assert_eq!(imported.notes[0].velocity, 80);
+    assert!(!imported.notes[0].generated);
+}
+
+#[test]
+fn midi_import_folds_sustain_into_note_duration() {
+    let track = vec![
+        TrackEvent {
+            delta: u28::new(0),
+            kind: TrackEventKind::Midi {
+                channel: u4::new(0),
+                message: MidiMessage::NoteOn {
+                    key: u7::new(60),
+                    vel: u7::new(80),
+                },
+            },
+        },
+        TrackEvent {
+            delta: u28::new(24),
+            kind: TrackEventKind::Midi {
+                channel: u4::new(0),
+                message: MidiMessage::Controller {
+                    controller: u7::new(64),
+                    value: u7::new(127),
+                },
+            },
+        },
+        TrackEvent {
+            delta: u28::new(0),
+            kind: TrackEventKind::Midi {
+                channel: u4::new(0),
+                message: MidiMessage::NoteOff {
+                    key: u7::new(60),
+                    vel: u7::new(0),
+                },
+            },
+        },
+        TrackEvent {
+            delta: u28::new(24),
+            kind: TrackEventKind::Midi {
+                channel: u4::new(0),
+                message: MidiMessage::Controller {
+                    controller: u7::new(64),
+                    value: u7::new(0),
+                },
+            },
+        },
+        TrackEvent {
+            delta: u28::new(0),
+            kind: TrackEventKind::Meta(MetaMessage::EndOfTrack),
+        },
+    ];
+    let smf = Smf {
+        header: Header::new(Format::SingleTrack, Timing::Metrical(u15::new(24))),
+        tracks: vec![track],
+    };
+    let mut bytes = Vec::new();
+    smf.write_std(&mut bytes).unwrap();
+
+    let imported = decode_midi(&bytes).unwrap();
+    assert_eq!(imported.notes.len(), 1);
+    assert_eq!(imported.notes[0].duration_ms, 1_000);
+}
+
+#[test]
+fn model_output_rejects_values_outside_midi_range() {
+    assert!(parse_generated_notes("128,0,12,80").is_err());
+    assert!(parse_generated_notes("60,0,12,128").is_err());
+    assert_eq!(
+        parse_generated_notes("60,0,12,80").unwrap(),
+        vec![(60, 0, 12, 80)]
+    );
 }
 
 #[test]
@@ -65,6 +170,7 @@ fn playhead_maps_wall_time_to_musical_time() {
     assert_eq!(playback.position(2_000), Some(900));
     playback.finish(generation);
     assert_eq!(playback.position(2_000), None);
+    assert!(!playback.is_active(generation));
 }
 
 #[test]
@@ -136,12 +242,35 @@ fn timeline_bounds_include_playhead() {
 fn recording_resumes_from_its_frozen_position() {
     let mut state = Shared::default();
     assert!(state.toggle_capture(100, None));
-    assert_eq!(state.capture_position(250), 150);
-    assert!(!state.toggle_capture(250, None));
+    assert_eq!(state.capture_position(250), 0);
+    state.capture_started_ms = 250;
+    state.capture_has_input = true;
+    assert_eq!(state.capture_position(400), 150);
+
+    assert!(!state.toggle_capture(400, None));
     assert_eq!(state.capture_position(5_000), 150);
     assert!(state.toggle_capture(5_000, None));
-    assert_eq!(state.capture_position(5_100), 250);
+    assert_eq!(state.capture_position(5_100), 150);
+    state.capture_started_ms = 5_100;
+    state.capture_has_input = true;
+    assert_eq!(state.capture_position(5_200), 250);
     assert_eq!(state.capture_generation, 3);
+}
+
+#[test]
+fn every_recording_session_waits_for_fresh_input() {
+    let mut state = Shared::default();
+    assert!(state.toggle_capture(0, Some(500)));
+    assert_eq!(state.capture_position(1_000), 500);
+
+    state.capture_started_ms = 1_000;
+    state.capture_has_input = true;
+    assert_eq!(state.capture_position(1_100), 600);
+
+    assert!(!state.toggle_capture(1_100, None));
+    assert!(state.toggle_capture(1_200, None));
+    assert!(!state.capture_has_input);
+    assert_eq!(state.capture_position(2_000), 600);
 }
 
 #[test]
@@ -158,13 +287,19 @@ fn recording_starts_from_the_selected_timeline_position() {
     };
 
     assert!(state.toggle_capture(100, Some(250)));
-    assert_eq!(state.capture_position(200), 350);
+    assert_eq!(state.capture_position(200), 250);
+    state.capture_started_ms = 200;
+    state.capture_has_input = true;
+    assert_eq!(state.capture_position(300), 350);
 }
 
 #[test]
 fn generated_notes_wait_for_soundfont_playback() {
     let shared = Arc::new(Mutex::new(Shared::default()));
-    add_generated(vec![(64, 0, 12, 90)], 120.0, None, shared.clone());
+    assert_eq!(
+        add_generated(vec![(64, 0, 12, 90)], 120.0, None, 0, shared.clone(),),
+        GeneratedUpdate::Applied(Some(0))
+    );
 
     let state = shared.lock().unwrap();
     assert_eq!(state.notes.len(), 1);
@@ -254,12 +389,27 @@ fn autocomplete_replaces_generated_notes_after_cursor() {
         ],
         ..Default::default()
     }));
-    add_generated(vec![(64, 0, 12, 90)], 120.0, Some(500), shared.clone());
+    assert_eq!(
+        add_generated(vec![(64, 0, 12, 90)], 120.0, Some(500), 0, shared.clone(),),
+        GeneratedUpdate::Applied(Some(500))
+    );
 
     let state = shared.lock().unwrap();
     assert_eq!(state.notes.len(), 2);
     assert_eq!(state.notes[1].pitch, 64);
     assert_eq!(state.notes[1].onset_ms, 500);
+}
+
+#[test]
+fn outdated_generation_cannot_reappear_after_timeline_changes() {
+    let shared = Arc::new(Mutex::new(Shared::default()));
+    shared.lock().unwrap().invalidate_generation();
+
+    assert_eq!(
+        add_generated(vec![(64, 0, 12, 90)], 120.0, None, 0, shared.clone(),),
+        GeneratedUpdate::Stale
+    );
+    assert!(shared.lock().unwrap().notes.is_empty());
 }
 
 #[test]

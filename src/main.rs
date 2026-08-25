@@ -1,5 +1,6 @@
 mod config;
 mod midi;
+mod midi_file;
 mod model;
 mod playback;
 mod state;

@@ -2,13 +2,31 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+pub(crate) const DEFAULT_AUTO_PAUSE_MS: u64 = 800;
+pub(crate) const DEFAULT_BPM: f64 = 120.0;
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(default)]
 pub(crate) struct AppConfig {
     pub(crate) midi_input: Option<String>,
     pub(crate) midi_output: Option<String>,
     pub(crate) model: Option<String>,
     pub(crate) soundfont: Option<String>,
+    pub(crate) auto_pause_ms: u64,
+    pub(crate) bpm: f64,
+}
+
+impl Default for AppConfig {
+    fn default() -> Self {
+        Self {
+            midi_input: None,
+            midi_output: None,
+            model: None,
+            soundfont: None,
+            auto_pause_ms: DEFAULT_AUTO_PAUSE_MS,
+            bpm: DEFAULT_BPM,
+        }
+    }
 }
 
 pub(crate) fn config_path() -> PathBuf {
