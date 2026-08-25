@@ -88,11 +88,13 @@ fn pause_and_seek_preserve_the_cursor() {
 
     assert!(playback.pause(1_250));
     assert_eq!(playback.cursor(), Some(750));
+    assert_eq!(playback.playback_start(), Some(750));
     assert!(playback.is_paused());
     assert!(!playback.is_playing());
 
     assert!(!playback.seek(1_500));
     assert_eq!(playback.cursor(), Some(1_500));
+    assert_eq!(playback.playback_start(), Some(1_500));
     assert!(playback.is_paused());
 }
 
@@ -265,9 +267,12 @@ fn stop_cancels_scheduled_midi_without_waiting() {
     let playback = Arc::new(PlaybackControl::default());
     let generation = playback.begin_rendering();
     assert!(playback.start_playback(generation));
+    playback.set_timeline(generation, 0, 500, 900);
     assert!(playback.is_playing());
-    playback.stop(0);
+    playback.stop(100);
     assert!(!playback.is_playing());
+    assert_eq!(playback.cursor(), Some(600));
+    assert_eq!(playback.playback_start(), None);
     let started = Instant::now();
     send_midi_events(
         vec![(10_000, true, 60, 80)],

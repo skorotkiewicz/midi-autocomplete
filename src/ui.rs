@@ -498,7 +498,7 @@ pub(crate) fn build_ui(app: &Application) {
             state_for_play.lock().unwrap().status = "Nothing to play".into();
             return;
         }
-        let musical_start_ms = playback_for_play.cursor();
+        let musical_start_ms = playback_for_play.playback_start();
         replay(
             notes,
             path,

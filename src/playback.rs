@@ -16,6 +16,7 @@ pub(crate) struct PlaybackControl {
     playing: AtomicBool,
     rendering: AtomicBool,
     paused: AtomicBool,
+    resume_from_cursor: AtomicBool,
     has_timeline: AtomicBool,
     has_cursor: AtomicBool,
     cursor_ms: AtomicU64,
@@ -30,6 +31,7 @@ impl PlaybackControl {
         self.has_timeline.store(false, Ordering::SeqCst);
         self.rendering.store(true, Ordering::SeqCst);
         self.paused.store(false, Ordering::SeqCst);
+        self.resume_from_cursor.store(false, Ordering::SeqCst);
         self.playing.store(false, Ordering::SeqCst);
         let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
         if let Some(player) = self.player.lock().unwrap().take() {
@@ -56,6 +58,7 @@ impl PlaybackControl {
         self.has_timeline.store(false, Ordering::SeqCst);
         self.rendering.store(false, Ordering::SeqCst);
         self.paused.store(true, Ordering::SeqCst);
+        self.resume_from_cursor.store(true, Ordering::SeqCst);
         self.playing.store(false, Ordering::SeqCst);
         self.generation.fetch_add(1, Ordering::SeqCst);
         if let Some(player) = self.player.lock().unwrap().take() {
@@ -72,6 +75,7 @@ impl PlaybackControl {
         self.has_timeline.store(false, Ordering::SeqCst);
         self.rendering.store(false, Ordering::SeqCst);
         self.paused.store(false, Ordering::SeqCst);
+        self.resume_from_cursor.store(false, Ordering::SeqCst);
         self.playing.store(false, Ordering::SeqCst);
         self.generation.fetch_add(1, Ordering::SeqCst);
         if let Some(player) = self.player.lock().unwrap().take() {
@@ -85,6 +89,7 @@ impl PlaybackControl {
         self.has_cursor.store(true, Ordering::SeqCst);
         self.has_timeline.store(false, Ordering::SeqCst);
         self.rendering.store(false, Ordering::SeqCst);
+        self.resume_from_cursor.store(true, Ordering::SeqCst);
         self.playing.store(false, Ordering::SeqCst);
         self.generation.fetch_add(1, Ordering::SeqCst);
         if let Some(player) = self.player.lock().unwrap().take() {
@@ -118,6 +123,13 @@ impl PlaybackControl {
         self.has_cursor
             .load(Ordering::SeqCst)
             .then(|| self.cursor_ms.load(Ordering::SeqCst))
+    }
+
+    pub(crate) fn playback_start(&self) -> Option<u64> {
+        self.resume_from_cursor
+            .load(Ordering::SeqCst)
+            .then(|| self.cursor())
+            .flatten()
     }
 
     pub(crate) fn set_timeline(
@@ -163,6 +175,7 @@ impl PlaybackControl {
             self.has_cursor.store(false, Ordering::SeqCst);
             self.rendering.store(false, Ordering::SeqCst);
             self.paused.store(false, Ordering::SeqCst);
+            self.resume_from_cursor.store(false, Ordering::SeqCst);
             self.playing.store(false, Ordering::SeqCst);
             current.take();
         }
