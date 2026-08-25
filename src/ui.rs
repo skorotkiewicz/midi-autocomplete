@@ -11,10 +11,10 @@ use crate::timeline::{
 use gtk4::glib;
 use gtk4::prelude::*;
 use gtk4::{
-    Adjustment, Application, ApplicationWindow, Box as GtkBox, Button, DrawingArea, DropDown,
-    Entry, FileChooserAction, FileChooserNative, FileFilter, GestureClick, HeaderBar, Label,
-    MenuButton, Orientation, Overlay, PolicyType, Popover, ResponseType, ScrolledWindow,
-    SpinButton, ToggleButton,
+    Adjustment, Application, ApplicationWindow, Box as GtkBox, Button, CheckButton, DrawingArea,
+    DropDown, Entry, FileChooserAction, FileChooserNative, FileFilter, GestureClick, HeaderBar,
+    Label, MenuButton, Orientation, Overlay, PolicyType, Popover, ResponseType, ScrolledWindow,
+    SpinButton,
 };
 use midir::{MidiInputConnection, MidiOutputConnection};
 use std::cell::RefCell;
@@ -177,17 +177,18 @@ pub(crate) fn build_ui(app: &Application) {
     let import_midi_button = Button::with_label("Import MIDI");
     let export_midi_button = Button::with_label("Export MIDI");
     let quit = Button::with_label("Quit");
-    let auto_mode = ToggleButton::with_label("Auto");
-    let explicit_mode = ToggleButton::with_label("Explicit");
+    let auto_mode = CheckButton::with_label("Auto");
+    let explicit_mode = CheckButton::with_label("Explicit");
     explicit_mode.set_group(Some(&auto_mode));
     auto_mode.set_active(true);
-    let generate = Button::with_label("Autocomplete");
-    generate.set_visible(false);
+    let generate = Button::builder()
+        .label("Autocomplete")
+        .sensitive(false)
+        .tooltip_text("Available in Explicit mode")
+        .build();
     let play = Button::with_label("Play");
     let pause = Button::with_label("Pause");
     let stop = Button::with_label("Stop");
-    pause.set_visible(false);
-    stop.set_visible(false);
     let browse = Button::with_label("Browse");
     let soundfont = Entry::builder()
         .placeholder_text("Select a .sf2 SoundFont")
@@ -924,15 +925,20 @@ pub(crate) fn build_ui(app: &Application) {
             "Rec"
         });
         let generating = generation_busy_for_timer.load(Ordering::SeqCst);
-        generate_for_timer.set_visible(explicit_mode_for_timer.is_active());
-        generate_for_timer.set_sensitive(!generating);
+        let explicit = explicit_mode_for_timer.is_active();
+        generate_for_timer.set_sensitive(explicit && !generating);
+        generate_for_timer.set_tooltip_text(if explicit {
+            generating.then_some("Wait for generation to finish")
+        } else {
+            Some("Available in Explicit mode")
+        });
         let playing = playback_for_timer.is_playing();
         let paused = playback_for_timer.is_paused();
+        let rendering = playback_for_timer.is_rendering();
         play_for_timer.set_label(if paused { "Resume" } else { "Play" });
-        play_for_timer.set_visible(!playing);
-        play_for_timer.set_sensitive(!playback_for_timer.is_rendering() && !generating);
-        pause_for_timer.set_visible(playing);
-        stop_for_timer.set_visible(playing || paused);
+        play_for_timer.set_sensitive(!playing && !rendering && !generating);
+        pause_for_timer.set_sensitive(playing);
+        stop_for_timer.set_sensitive(playing || paused || rendering);
         roll_for_timer.queue_draw();
         playhead_for_timer.queue_draw();
         glib::ControlFlow::Continue
@@ -952,11 +958,11 @@ pub(crate) fn build_ui(app: &Application) {
     file_menu.set_popover(Some(&file_popover));
 
     let settings = GtkBox::new(Orientation::Vertical, 6);
-    settings.set_width_request(420);
-    settings.set_margin_top(12);
-    settings.set_margin_bottom(12);
-    settings.set_margin_start(12);
-    settings.set_margin_end(12);
+    settings.set_width_request(460);
+    settings.set_margin_top(10);
+    settings.set_margin_bottom(10);
+    settings.set_margin_start(10);
+    settings.set_margin_end(10);
     settings.append(&Label::builder().label("MIDI input").xalign(0.0).build());
     settings.append(&input_dropdown);
     settings.append(&Label::builder().label("MIDI output").xalign(0.0).build());
@@ -965,7 +971,12 @@ pub(crate) fn build_ui(app: &Application) {
     device_actions.append(&connect);
     device_actions.append(&refresh);
     settings.append(&device_actions);
-    settings.append(&Label::builder().label("Model").xalign(0.0).build());
+    settings.append(
+        &Label::builder()
+            .label("Model checkpoint")
+            .xalign(0.0)
+            .build(),
+    );
     let model_row = GtkBox::new(Orientation::Horizontal, 6);
     model_row.append(&model);
     model_row.append(&model_browse);
@@ -999,16 +1010,16 @@ pub(crate) fn build_ui(app: &Application) {
     header.pack_start(&file_menu);
     header.pack_end(&settings_menu);
 
-    let controls = GtkBox::new(Orientation::Horizontal, 8);
-    controls.append(&Label::new(Some("Mode")));
-    controls.append(&auto_mode);
-    controls.append(&explicit_mode);
+    let controls = GtkBox::new(Orientation::Horizontal, 6);
     controls.append(&record);
     controls.append(&generate);
     controls.append(&play);
     controls.append(&pause);
     controls.append(&stop);
     controls.append(&clear);
+    controls.append(&Label::new(Some("Mode")));
+    controls.append(&auto_mode);
+    controls.append(&explicit_mode);
 
     let content = GtkBox::new(Orientation::Vertical, 8);
     content.set_margin_top(12);
