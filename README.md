@@ -13,8 +13,8 @@ Requirements: GTK4, ALSA development headers on Linux, Rust, and [uv](https://do
 cargo run --release
 ```
 
-1. Select a MIDI keyboard input and output. Click **Refresh** after you connect new hardware.
-2. Select a local checkpoint, performance BPM, and `.sf2` SoundFont.
+1. Open **Settings**, then select a MIDI keyboard input and output. Click **Refresh** after you connect new hardware.
+2. In **Settings**, select a local checkpoint, performance BPM, and `.sf2` SoundFont.
 3. Click **Connect**, then click **Rec** and play a prompt.
 4. Use **Auto** or **Explicit** generation.
 
@@ -26,9 +26,9 @@ The red playhead follows recording and playback on the scrollable timeline. Clic
 
 Play renders the SoundFont through the computer's default audio device and sends the same notes to the selected MIDI output. Blue notes are MIDI input. Green notes come from the model. The app records velocity and duration, including sustain-pedal time.
 
-**Import MIDI** replaces the timeline with notes from a standard `.mid` or `.midi` file. The app merges parallel tracks, applies tempo changes, and folds sustain into note duration. Imported notes are blue. Sequential multi-song files and SMPTE timing are not supported.
+**File → Import MIDI** replaces the timeline with notes from a standard `.mid` or `.midi` file. The app merges parallel tracks, applies tempo changes, and folds sustain into note duration. Imported notes are blue. Sequential multi-song files and SMPTE timing are not supported.
 
-**Export MIDI** writes all timeline notes to one piano track at the selected BPM. Standard MIDI does not store whether this app or the model created a note, so that distinction is not preserved after import.
+**File → Export MIDI** writes all timeline notes to one piano track at the selected BPM. Standard MIDI does not store whether this app or the model created a note, so that distinction is not preserved after import.
 
 ## Configuration
 

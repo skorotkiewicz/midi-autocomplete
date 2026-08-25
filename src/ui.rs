@@ -12,8 +12,9 @@ use gtk4::glib;
 use gtk4::prelude::*;
 use gtk4::{
     Adjustment, Application, ApplicationWindow, Box as GtkBox, Button, DrawingArea, DropDown,
-    Entry, FileChooserAction, FileChooserNative, FileFilter, GestureClick, Label, Orientation,
-    Overlay, PolicyType, ResponseType, ScrolledWindow, SpinButton, ToggleButton,
+    Entry, FileChooserAction, FileChooserNative, FileFilter, GestureClick, HeaderBar, Label,
+    MenuButton, Orientation, Overlay, PolicyType, Popover, ResponseType, ScrolledWindow,
+    SpinButton, ToggleButton,
 };
 use midir::{MidiInputConnection, MidiOutputConnection};
 use std::cell::RefCell;
@@ -176,6 +177,7 @@ pub(crate) fn build_ui(app: &Application) {
     let clear = Button::with_label("Clear");
     let import_midi_button = Button::with_label("Import MIDI");
     let export_midi_button = Button::with_label("Export MIDI");
+    let quit = Button::with_label("Quit");
     let auto_mode = ToggleButton::with_label("Auto");
     let explicit_mode = ToggleButton::with_label("Explicit");
     explicit_mode.set_group(Some(&auto_mode));
@@ -898,54 +900,93 @@ pub(crate) fn build_ui(app: &Application) {
         glib::ControlFlow::Continue
     });
 
-    let devices = GtkBox::new(Orientation::Horizontal, 8);
-    devices.append(&Label::new(Some("Input")));
-    devices.append(&input_dropdown);
-    devices.append(&Label::new(Some("Output")));
-    devices.append(&output_dropdown);
-    devices.append(&connect);
-    devices.append(&refresh);
+    let file_box = GtkBox::new(Orientation::Vertical, 6);
+    file_box.set_margin_top(8);
+    file_box.set_margin_bottom(8);
+    file_box.set_margin_start(8);
+    file_box.set_margin_end(8);
+    file_box.append(&import_midi_button);
+    file_box.append(&export_midi_button);
+    file_box.append(&quit);
+    let file_popover = Popover::new();
+    file_popover.set_child(Some(&file_box));
+    let file_menu = MenuButton::builder().label("File").build();
+    file_menu.set_popover(Some(&file_popover));
+
+    let settings = GtkBox::new(Orientation::Vertical, 6);
+    settings.set_width_request(420);
+    settings.set_margin_top(12);
+    settings.set_margin_bottom(12);
+    settings.set_margin_start(12);
+    settings.set_margin_end(12);
+    settings.append(&Label::builder().label("MIDI input").xalign(0.0).build());
+    settings.append(&input_dropdown);
+    settings.append(&Label::builder().label("MIDI output").xalign(0.0).build());
+    settings.append(&output_dropdown);
+    let device_actions = GtkBox::new(Orientation::Horizontal, 6);
+    device_actions.append(&connect);
+    device_actions.append(&refresh);
+    settings.append(&device_actions);
+    settings.append(&Label::builder().label("Model").xalign(0.0).build());
+    let model_row = GtkBox::new(Orientation::Horizontal, 6);
+    model_row.append(&model);
+    model_row.append(&model_browse);
+    settings.append(&model_row);
+    settings.append(&Label::builder().label("SoundFont").xalign(0.0).build());
+    let soundfont_row = GtkBox::new(Orientation::Horizontal, 6);
+    soundfont_row.append(&soundfont);
+    soundfont_row.append(&browse);
+    settings.append(&soundfont_row);
+    settings.append(&Label::builder().label("BPM").xalign(0.0).build());
+    settings.append(&bpm);
+    let settings_popover = Popover::new();
+    settings_popover.set_child(Some(&settings));
+    let settings_menu = MenuButton::builder()
+        .icon_name("preferences-system-symbolic")
+        .tooltip_text("Settings")
+        .build();
+    settings_menu.set_popover(Some(&settings_popover));
+
+    let header = HeaderBar::new();
+    header.set_title_widget(Some(&Label::new(Some("MIDI Autocomplete"))));
+    header.set_show_title_buttons(true);
+    header.pack_start(&file_menu);
+    header.pack_end(&settings_menu);
 
     let controls = GtkBox::new(Orientation::Horizontal, 8);
-    controls.append(&Label::new(Some("Model")));
-    controls.append(&model);
-    controls.append(&model_browse);
     controls.append(&Label::new(Some("Mode")));
     controls.append(&auto_mode);
     controls.append(&explicit_mode);
-    controls.append(&Label::new(Some("BPM")));
-    controls.append(&bpm);
+    controls.append(&record);
     controls.append(&generate);
-    controls.append(&import_midi_button);
-    controls.append(&export_midi_button);
+    controls.append(&play);
+    controls.append(&pause);
+    controls.append(&stop);
     controls.append(&clear);
-
-    let playback = GtkBox::new(Orientation::Horizontal, 8);
-    playback.append(&Label::new(Some("SoundFont")));
-    playback.append(&soundfont);
-    playback.append(&browse);
-    playback.append(&record);
-    playback.append(&play);
-    playback.append(&pause);
-    playback.append(&stop);
 
     let content = GtkBox::new(Orientation::Vertical, 8);
     content.set_margin_top(12);
     content.set_margin_bottom(12);
     content.set_margin_start(12);
     content.set_margin_end(12);
-    content.append(&devices);
     content.append(&controls);
-    content.append(&playback);
     content.append(&timeline_overlay);
     content.append(&status);
 
-    ApplicationWindow::builder()
+    let app_for_quit = app.clone();
+    quit.connect_clicked(move |_| app_for_quit.quit());
+    let file_popover_for_import = file_popover.clone();
+    import_midi_button.connect_clicked(move |_| file_popover_for_import.popdown());
+    let file_popover_for_export = file_popover.clone();
+    export_midi_button.connect_clicked(move |_| file_popover_for_export.popdown());
+
+    let window = ApplicationWindow::builder()
         .application(app)
         .title("MIDI Autocomplete")
         .default_width(1000)
         .default_height(600)
         .child(&content)
-        .build()
-        .present();
+        .build();
+    window.set_titlebar(Some(&header));
+    window.present();
 }
