@@ -3,7 +3,9 @@ use crate::midi::{connect_devices, midi_inputs, midi_outputs, silence_output};
 use crate::model::{GenerationRequest, ModelProcess, prompt, resolve_model_path};
 use crate::playback::{PlaybackControl, add_generated, replay};
 use crate::state::Shared;
-use crate::timeline::{PIXELS_PER_MS, draw_roll, timeline_bounds};
+use crate::timeline::{
+    PIXELS_PER_MS, draw_roll, scroll_for_playhead, timeline_bounds, timeline_content_width,
+};
 use gtk4::glib;
 use gtk4::prelude::*;
 use gtk4::{
@@ -697,18 +699,14 @@ pub(crate) fn build_ui(app: &Application) {
 
         let viewport = timeline_for_timer.width().max(1);
         let content_width = bounds.map_or(viewport, |(start, end)| {
-            ((end.saturating_sub(start) + 1_000) as f64 * PIXELS_PER_MS) as i32
+            timeline_content_width(start, end, viewport)
         });
         roll_for_timer.set_content_width(content_width.max(viewport));
         if let (Some(playhead), Some((start, _))) = (playhead, bounds) {
             let x = playhead.saturating_sub(start) as f64 * PIXELS_PER_MS;
-            let adjustment = timeline_for_timer.hadjustment();
-            let page = viewport as f64;
-            if x > adjustment.value() + page - 40.0 {
-                adjustment.set_value((x - page + 40.0).max(0.0));
-            } else if x < adjustment.value() {
-                adjustment.set_value(x.max(0.0));
-            }
+            timeline_for_timer
+                .hadjustment()
+                .set_value(scroll_for_playhead(x, viewport as f64));
         }
         record_for_timer.set_label(if state_for_timer.lock().unwrap().capturing {
             "Stop Rec"

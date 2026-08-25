@@ -5,7 +5,7 @@ use crate::playback::{
     PlaybackControl, add_generated, render_soundfont, replay_events_from, send_midi_events,
 };
 use crate::state::{Note, Shared};
-use crate::timeline::timeline_bounds;
+use crate::timeline::{scroll_for_playhead, timeline_bounds, timeline_content_width};
 use crate::ui::{auto_generation_due, preferred_index};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -92,6 +92,17 @@ fn pause_and_seek_preserve_the_cursor() {
     assert!(!playback.seek(1_500));
     assert_eq!(playback.cursor(), Some(1_500));
     assert!(playback.is_paused());
+}
+
+#[test]
+fn playhead_stays_at_twenty_percent_after_the_opening() {
+    assert_eq!(scroll_for_playhead(100.0, 1_000.0), 0.0);
+    assert_eq!(scroll_for_playhead(200.0, 1_000.0), 0.0);
+    assert_eq!(scroll_for_playhead(500.0, 1_000.0), 300.0);
+
+    let content_width = timeline_content_width(0, 12_500, 1_000);
+    let maximum_scroll = content_width - 1_000;
+    assert_eq!(1_000 - maximum_scroll, 200);
 }
 
 #[test]

@@ -3,6 +3,15 @@ use gtk4::cairo;
 
 pub(crate) const PIXELS_PER_MS: f64 = 0.08;
 
+pub(crate) fn scroll_for_playhead(playhead_x: f64, viewport_width: f64) -> f64 {
+    (playhead_x - viewport_width * 0.2).max(0.0)
+}
+
+pub(crate) fn timeline_content_width(start_ms: u64, end_ms: u64, viewport_width: i32) -> i32 {
+    let timeline_width = end_ms.saturating_sub(start_ms) as f64 * PIXELS_PER_MS;
+    (timeline_width + viewport_width as f64 * 0.8).ceil() as i32
+}
+
 pub(crate) fn timeline_bounds(notes: &[Note], playhead: Option<u64>) -> Option<(u64, u64)> {
     let start = notes.iter().map(|note| note.onset_ms).min().or(playhead)?;
     let end = notes
