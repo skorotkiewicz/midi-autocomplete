@@ -230,27 +230,17 @@ pub(crate) fn build_ui(app: &Application) {
 
     let state_for_playhead = shared.clone();
     let playback_for_playhead = playback_control.clone();
-    let timeline_for_playhead = timeline.clone();
     playhead_layer.set_draw_func(move |_, cr, width, height| {
         let now = started.elapsed().as_millis() as u64;
         let state = state_for_playhead.lock().unwrap();
-        let playing = playback_for_playhead.is_playing();
-        let playhead = if playing {
+        let playhead = if playback_for_playhead.is_playing() {
             playback_for_playhead.position(now)
         } else if state.capturing {
             Some(state.capture_position(now))
         } else {
             playback_for_playhead.cursor()
         };
-        draw_playhead(
-            cr,
-            width,
-            height,
-            &state.notes,
-            playhead,
-            timeline_for_playhead.hadjustment().value(),
-            playing || state.capturing,
-        );
+        draw_playhead(cr, width, height, &state.notes, playhead);
     });
 
     let config_for_input = config.clone();
@@ -542,6 +532,7 @@ pub(crate) fn build_ui(app: &Application) {
     let output_for_seek = output.clone();
     let playback_for_seek = playback_control.clone();
     let soundfont_for_seek = soundfont.clone();
+    let timeline_for_seek = timeline.clone();
     seek.connect_pressed(move |_, _, x, _| {
         let now = started.elapsed().as_millis() as u64;
         let (notes, bounds) = {
@@ -556,6 +547,13 @@ pub(crate) fn build_ui(app: &Application) {
             return;
         };
         let position = (start + (x.max(0.0) / PIXELS_PER_MS) as u64).min(end);
+        let position_x = position.saturating_sub(start) as f64 * PIXELS_PER_MS;
+        timeline_for_seek
+            .hadjustment()
+            .set_value(scroll_for_playhead(
+                position_x,
+                timeline_for_seek.width().max(1) as f64,
+            ));
         let was_playing = playback_for_seek.seek(position);
         state_for_seek.lock().unwrap().status =
             format!("Position: {:.2}s", position as f64 / 1_000.0);
