@@ -254,12 +254,22 @@ pub(crate) fn build_ui(app: &Application) {
     }
 
     let state_for_record = shared.clone();
+    let playback_for_record = playback_control.clone();
     record.connect_clicked(move |_| {
-        let mut state = state_for_record.lock().unwrap();
-        if state.connected {
-            state.toggle_capture(started.elapsed().as_millis() as u64);
-        } else {
-            state.status = "Connect MIDI devices before recording.".into();
+        let selected_position = {
+            let mut state = state_for_record.lock().unwrap();
+            if !state.connected {
+                state.status = "Connect MIDI devices before recording.".into();
+                return;
+            }
+            let selected_position = (!state.capturing)
+                .then(|| playback_for_record.cursor())
+                .flatten();
+            state.toggle_capture(started.elapsed().as_millis() as u64, selected_position);
+            selected_position
+        };
+        if selected_position.is_some() {
+            playback_for_record.reset();
         }
     });
 

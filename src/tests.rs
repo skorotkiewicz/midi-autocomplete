@@ -101,13 +101,30 @@ fn timeline_bounds_include_playhead() {
 #[test]
 fn recording_resumes_from_its_frozen_position() {
     let mut state = Shared::default();
-    assert!(state.toggle_capture(100));
+    assert!(state.toggle_capture(100, None));
     assert_eq!(state.capture_position(250), 150);
-    assert!(!state.toggle_capture(250));
+    assert!(!state.toggle_capture(250, None));
     assert_eq!(state.capture_position(5_000), 150);
-    assert!(state.toggle_capture(5_000));
+    assert!(state.toggle_capture(5_000, None));
     assert_eq!(state.capture_position(5_100), 250);
     assert_eq!(state.capture_generation, 3);
+}
+
+#[test]
+fn recording_starts_from_the_selected_timeline_position() {
+    let mut state = Shared {
+        notes: vec![Note {
+            pitch: 60,
+            onset_ms: 1_000,
+            duration_ms: 500,
+            velocity: 80,
+            generated: false,
+        }],
+        ..Default::default()
+    };
+
+    assert!(state.toggle_capture(100, Some(250)));
+    assert_eq!(state.capture_position(200), 350);
 }
 
 #[test]

@@ -28,18 +28,24 @@ impl Shared {
             }
     }
 
-    pub(crate) fn toggle_capture(&mut self, now_ms: u64) -> bool {
+    pub(crate) fn toggle_capture(
+        &mut self,
+        now_ms: u64,
+        selected_position_ms: Option<u64>,
+    ) -> bool {
         if self.capturing {
             self.capture_position_ms = self.capture_position(now_ms);
             self.capturing = false;
         } else {
-            self.capture_position_ms = self.capture_position_ms.max(
-                self.notes
-                    .iter()
-                    .map(|note| note.onset_ms + note.duration_ms)
-                    .max()
-                    .unwrap_or(0),
-            );
+            self.capture_position_ms = selected_position_ms.unwrap_or_else(|| {
+                self.capture_position_ms.max(
+                    self.notes
+                        .iter()
+                        .map(|note| note.onset_ms + note.duration_ms)
+                        .max()
+                        .unwrap_or(0),
+                )
+            });
             self.capture_started_ms = now_ms;
             self.capturing = true;
         }
