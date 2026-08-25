@@ -37,9 +37,9 @@ impl Capture {
         }
     }
 
-    fn receive(&mut self, message: &[u8], now_ms: u64, shared: &Arc<Mutex<Shared>>) {
+    fn receive(&mut self, message: &[u8], now_ms: u64, shared: &Arc<Mutex<Shared>>) -> bool {
         if message.len() < 3 {
-            return;
+            return false;
         }
         // ponytail: piano input treats all MIDI channels as one; split by channel if multi-instrument input matters.
         match message[0] & 0xf0 {
@@ -72,8 +72,9 @@ impl Capture {
                     }
                 }
             }
-            _ => {}
+            _ => return false,
         }
+        true
     }
 }
 
@@ -137,8 +138,12 @@ pub(crate) fn connect_input(
                     capture = Capture::new();
                     capture_generation = generation;
                 }
-                if let Some(position) = position {
-                    capture.receive(message, position, &shared);
+                if let Some(position) = position
+                    && capture.receive(message, position, &shared)
+                {
+                    let mut state = shared.lock().unwrap();
+                    state.input_active = capture.held.iter().any(Option::is_some);
+                    state.last_input_ms = now;
                 }
             },
             (),

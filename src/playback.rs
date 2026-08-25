@@ -361,7 +361,7 @@ pub(crate) fn add_generated(
     bpm: f64,
     musical_start_ms: Option<u64>,
     shared: Arc<Mutex<Shared>>,
-) {
+) -> Option<u64> {
     let step_ms = 60_000.0 / bpm / 24.0;
     let musical_base = musical_start_ms.unwrap_or_else(|| {
         shared
@@ -393,6 +393,7 @@ pub(crate) fn add_generated(
         });
     }
     let count = notes.len();
+    let generated_start_ms = notes.first().map(|note| note.onset_ms);
     let mut state = shared.lock().unwrap();
     for note in state.notes.iter_mut().filter(|note| note.generated) {
         if note.onset_ms < musical_base && note.onset_ms + note.duration_ms > musical_base {
@@ -408,4 +409,5 @@ pub(crate) fn add_generated(
     } else {
         format!("Generated {count} notes. Click Play to render them.")
     };
+    generated_start_ms
 }

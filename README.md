@@ -13,12 +13,18 @@ Requirements: GTK4, ALSA development headers on Linux, Rust, and [uv](https://do
 cargo run --release
 ```
 
-1. Select a MIDI keyboard input and a synth or keyboard output. Click **Refresh** after connecting new hardware.
-2. Click **Connect**, then **Rec** to capture a prompt. Click **Stop Rec** when the prompt is complete.
-3. Set the checkpoint path and performance BPM, then click **Autocomplete**.
-4. Choose a `.sf2` SoundFont and click **Play** to replay the full piano roll. **Stop** appears during playback.
+1. Select a MIDI keyboard input and output. Click **Refresh** after you connect new hardware.
+2. Select a local checkpoint, performance BPM, and `.sf2` SoundFont.
+3. Click **Connect**, then click **Rec** and play a prompt.
+4. Use **Auto** or **Explicit** generation.
 
-The red playhead follows recording and playback on a horizontally scrollable timeline. Play renders the SoundFont through the computer's default audio device and simultaneously sends notes to the connected MIDI output. Blue piano-roll notes are input and green notes come from the model. The app records note duration and folds sustain-pedal time into it before inference.
+**Auto** is the default mode. After 800 ms without a pressed or sustained note, the app stops recording and generates a continuation. It renders the continuation with the selected SoundFont before it sends audio or MIDI. Recording resumes at the end of the continuation.
+
+**Explicit** waits for **Autocomplete**. It can generate from the recorded prompt or from silence. Generated notes stay silent until you click **Play** and SoundFont rendering finishes.
+
+The red playhead follows recording and playback on the scrollable timeline. Click the timeline to seek. **Pause** freezes playback at the playhead, and **Resume** continues from that position. **Stop** keeps the position for the next Autocomplete request. **Clear** resets the notes and playhead.
+
+Play renders the SoundFont through the computer's default audio device and sends the same notes to the selected MIDI output. Blue notes are MIDI input. Green notes come from the model. The app records velocity and duration, including sustain-pedal time.
 
 ## Configuration
 

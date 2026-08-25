@@ -8,6 +8,8 @@ pub(crate) struct GenerationRequest {
     pub(crate) prompt: String,
     pub(crate) bpm: f64,
     pub(crate) musical_start_ms: Option<u64>,
+    pub(crate) auto_play: bool,
+    pub(crate) soundfont: Option<PathBuf>,
 }
 
 pub(crate) struct ModelProcess {

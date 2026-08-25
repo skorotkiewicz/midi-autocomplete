@@ -9,15 +9,30 @@ use gtk4::prelude::*;
 use gtk4::{
     Adjustment, Application, ApplicationWindow, Box as GtkBox, Button, DrawingArea, DropDown,
     Entry, FileChooserAction, FileChooserNative, FileFilter, GestureClick, Label, Orientation,
-    PolicyType, ResponseType, ScrolledWindow, SpinButton,
+    PolicyType, ResponseType, ScrolledWindow, SpinButton, ToggleButton,
 };
 use midir::{MidiInputConnection, MidiOutputConnection};
 use std::cell::RefCell;
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
+
+const AUTO_PAUSE_MS: u64 = 800;
+
+pub(crate) fn auto_generation_due(
+    now_ms: u64,
+    last_input_ms: u64,
+    input_active: bool,
+    input_notes: usize,
+    requested_notes: usize,
+) -> bool {
+    !input_active
+        && input_notes > requested_notes
+        && now_ms.saturating_sub(last_input_ms) >= AUTO_PAUSE_MS
+}
 
 pub(crate) fn preferred_index(names: &[String], preferred: Option<&str>) -> Option<u32> {
     preferred.and_then(|name| {
@@ -53,6 +68,68 @@ fn refresh_dropdown(dropdown: &DropDown, names: &[String], preferred: Option<&st
     }
 }
 
+#[derive(Clone)]
+struct GenerationControls {
+    shared: Arc<Mutex<Shared>>,
+    playback: Arc<PlaybackControl>,
+    model: Entry,
+    soundfont: Entry,
+    bpm: SpinButton,
+    config: Arc<Mutex<AppConfig>>,
+    config_path: PathBuf,
+    requests: mpsc::Sender<GenerationRequest>,
+    started: Instant,
+}
+
+impl GenerationControls {
+    fn queue(&self, allow_empty: bool, auto_play: bool) -> bool {
+        let musical_start_ms = self
+            .playback
+            .position(self.started.elapsed().as_millis() as u64)
+            .or_else(|| self.playback.cursor());
+        let prompt_text = {
+            let state = self.shared.lock().unwrap();
+            prompt(&state.notes, self.bpm.value(), musical_start_ms)
+        };
+        if prompt_text.is_empty() && !allow_empty {
+            self.shared.lock().unwrap().status =
+                "Play at least one complete note before this position".into();
+            return false;
+        }
+
+        let model_path = self.model.text().to_string();
+        let soundfont_path = PathBuf::from(self.soundfont.text().as_str());
+        let soundfont_path = (!soundfont_path.as_os_str().is_empty()).then_some(soundfont_path);
+        let snapshot = {
+            let mut config = self.config.lock().unwrap();
+            config.model = Some(model_path.clone());
+            if let Some(path) = &soundfont_path {
+                config.soundfont = Some(path.to_string_lossy().into_owned());
+            }
+            config.clone()
+        };
+        if let Err(error) = save_config(&self.config_path, &snapshot) {
+            self.shared.lock().unwrap().status = error;
+            return false;
+        }
+
+        self.shared.lock().unwrap().status = "Generating...".into();
+        let request = GenerationRequest {
+            checkpoint: PathBuf::from(model_path),
+            prompt: prompt_text,
+            bpm: self.bpm.value(),
+            musical_start_ms,
+            auto_play,
+            soundfont: soundfont_path,
+        };
+        if self.requests.send(request).is_err() {
+            self.shared.lock().unwrap().status = "Model worker stopped".into();
+            return false;
+        }
+        true
+    }
+}
+
 pub(crate) fn build_ui(app: &Application) {
     let started = Instant::now();
     let config_path = config_path();
@@ -66,6 +143,8 @@ pub(crate) fn build_ui(app: &Application) {
     }));
     let output: Arc<Mutex<Option<MidiOutputConnection>>> = Arc::new(Mutex::new(None));
     let playback_control = Arc::new(PlaybackControl::default());
+    let auto_busy = Arc::new(AtomicBool::new(false));
+    let auto_resume = Arc::new(AtomicBool::new(false));
     let input_connection: Rc<RefCell<Option<MidiInputConnection<()>>>> =
         Rc::new(RefCell::new(None));
     let input_names = midi_inputs();
@@ -76,7 +155,12 @@ pub(crate) fn build_ui(app: &Application) {
     let refresh = Button::with_label("Refresh");
     let record = Button::with_label("Rec");
     let clear = Button::with_label("Clear");
+    let auto_mode = ToggleButton::with_label("Auto");
+    let explicit_mode = ToggleButton::with_label("Explicit");
+    explicit_mode.set_group(Some(&auto_mode));
+    auto_mode.set_active(true);
     let generate = Button::with_label("Autocomplete");
+    generate.set_visible(false);
     let play = Button::with_label("Play");
     let pause = Button::with_label("Pause");
     let stop = Button::with_label("Stop");
@@ -275,7 +359,9 @@ pub(crate) fn build_ui(app: &Application) {
 
     let state_for_clear = shared.clone();
     let playback_for_clear = playback_control.clone();
+    let auto_resume_for_clear = auto_resume.clone();
     clear.connect_clicked(move |_| {
+        auto_resume_for_clear.store(false, Ordering::SeqCst);
         playback_for_clear.reset();
         state_for_clear
             .lock()
@@ -411,7 +497,9 @@ pub(crate) fn build_ui(app: &Application) {
 
     let state_for_stop = shared.clone();
     let playback_for_stop = playback_control.clone();
+    let auto_resume_for_stop = auto_resume.clone();
     stop.connect_clicked(move |_| {
+        auto_resume_for_stop.store(false, Ordering::SeqCst);
         playback_for_stop.stop(started.elapsed().as_millis() as u64);
         state_for_stop.lock().unwrap().status = "Stopped".into();
     });
@@ -459,7 +547,21 @@ pub(crate) fn build_ui(app: &Application) {
     roll.add_controller(seek);
 
     let (requests, receiver) = mpsc::channel::<GenerationRequest>();
+    let generation_controls = GenerationControls {
+        shared: shared.clone(),
+        playback: playback_control.clone(),
+        model: model.clone(),
+        soundfont: soundfont.clone(),
+        bpm: bpm.clone(),
+        config: config.clone(),
+        config_path: config_path.clone(),
+        requests: requests.clone(),
+        started,
+    };
     let worker_state = shared.clone();
+    let worker_output = output.clone();
+    let worker_playback = playback_control.clone();
+    let worker_auto_busy = auto_busy.clone();
     thread::spawn(move || {
         let mut process: Option<ModelProcess> = None;
         while let Ok(request) = receiver.recv() {
@@ -471,89 +573,127 @@ pub(crate) fn build_ui(app: &Application) {
                     Ok(model) => Some(model),
                     Err(error) => {
                         worker_state.lock().unwrap().status = error;
+                        if request.auto_play {
+                            worker_auto_busy.store(false, Ordering::SeqCst);
+                        }
                         continue;
                     }
                 };
             }
             worker_state.lock().unwrap().status = "Generating...".into();
             match process.as_mut().unwrap().generate(&request.prompt) {
-                Ok(notes) => add_generated(
-                    notes,
-                    request.bpm,
-                    request.musical_start_ms,
-                    worker_state.clone(),
-                ),
+                Ok(notes) => {
+                    let generated_start_ms = add_generated(
+                        notes,
+                        request.bpm,
+                        request.musical_start_ms,
+                        worker_state.clone(),
+                    );
+                    if request.auto_play
+                        && let (Some(start), Some(soundfont)) =
+                            (generated_start_ms, request.soundfont)
+                    {
+                        let notes = worker_state.lock().unwrap().notes.clone();
+                        replay(
+                            notes,
+                            soundfont,
+                            Some(start),
+                            started,
+                            worker_state.clone(),
+                            worker_output.clone(),
+                            worker_playback.clone(),
+                        );
+                    }
+                }
                 Err(error) => {
                     worker_state.lock().unwrap().status = error;
                     process = None;
                 }
             }
+            if request.auto_play {
+                worker_auto_busy.store(false, Ordering::SeqCst);
+            }
         }
     });
 
-    let state_for_generate = shared.clone();
-    let model_for_generate = model.clone();
-    let bpm_for_generate = bpm.clone();
-    let config_for_generate = config.clone();
-    let path_for_generate = config_path.clone();
-    let playback_for_generate = playback_control.clone();
+    let explicit_generation = generation_controls.clone();
     generate.connect_clicked(move |_| {
-        let musical_start_ms = playback_for_generate
-            .position(started.elapsed().as_millis() as u64)
-            .or_else(|| playback_for_generate.cursor());
-        let state = state_for_generate.lock().unwrap();
-        let prompt_text = prompt(&state.notes, bpm_for_generate.value(), musical_start_ms);
-        if prompt_text.is_empty() {
-            drop(state);
-            state_for_generate.lock().unwrap().status =
-                "Play at least one complete note before this position".into();
-            return;
-        }
-        let model_path = model_for_generate.text().to_string();
-        let snapshot = {
-            let mut config = config_for_generate.lock().unwrap();
-            config.model = Some(model_path.clone());
-            config.clone()
-        };
-        if let Err(error) = save_config(&path_for_generate, &snapshot) {
-            drop(state);
-            state_for_generate.lock().unwrap().status = error;
-            return;
-        }
-        let request = GenerationRequest {
-            checkpoint: PathBuf::from(model_path),
-            prompt: prompt_text,
-            bpm: bpm_for_generate.value(),
-            musical_start_ms,
-        };
-        drop(state);
-        let _ = requests.send(request);
+        explicit_generation.queue(true, false);
     });
 
     let roll_for_timer = roll.clone();
     let timeline_for_timer = timeline.clone();
     let state_for_timer = shared.clone();
     let status_for_timer = status.clone();
+    let auto_mode_for_timer = auto_mode.clone();
+    let explicit_mode_for_timer = explicit_mode.clone();
+    let generate_for_timer = generate.clone();
     let play_for_timer = play.clone();
     let pause_for_timer = pause.clone();
     let stop_for_timer = stop.clone();
     let record_for_timer = record.clone();
     let playback_for_timer = playback_control.clone();
+    let auto_generation = generation_controls.clone();
+    let auto_busy_for_timer = auto_busy.clone();
+    let auto_resume_for_timer = auto_resume.clone();
+    let mut auto_requested_notes = 0;
     glib::timeout_add_local(Duration::from_millis(33), move || {
         let now = started.elapsed().as_millis() as u64;
-        let state = state_for_timer.lock().unwrap();
-        let playhead = if playback_for_timer.is_playing() {
-            playback_for_timer.position(now)
-        } else if state.capturing {
-            Some(state.capture_position(now))
-        } else {
-            playback_for_timer.cursor()
+        if auto_resume_for_timer.load(Ordering::SeqCst)
+            && !auto_busy_for_timer.load(Ordering::SeqCst)
+            && !playback_for_timer.is_rendering()
+            && !playback_for_timer.is_playing()
+            && !playback_for_timer.is_paused()
+        {
+            let mut state = state_for_timer.lock().unwrap();
+            if state.connected && !state.capturing {
+                state.toggle_capture(now, None);
+            }
+            auto_resume_for_timer.store(false, Ordering::SeqCst);
+        }
+
+        let auto_selected = auto_mode_for_timer.is_active();
+        let (playhead, bounds, should_auto) = {
+            let mut state = state_for_timer.lock().unwrap();
+            let input_notes = state.notes.iter().filter(|note| !note.generated).count();
+            if input_notes < auto_requested_notes {
+                auto_requested_notes = input_notes;
+            }
+            let should_auto = auto_selected
+                && state.capturing
+                && auto_generation_due(
+                    now,
+                    state.last_input_ms,
+                    state.input_active,
+                    input_notes,
+                    auto_requested_notes,
+                )
+                && !auto_busy_for_timer.load(Ordering::SeqCst)
+                && !playback_for_timer.is_rendering()
+                && !playback_for_timer.is_playing();
+            if should_auto {
+                auto_requested_notes = input_notes;
+                state.toggle_capture(now, None);
+                auto_busy_for_timer.store(true, Ordering::SeqCst);
+                auto_resume_for_timer.store(true, Ordering::SeqCst);
+            }
+            let playhead = if playback_for_timer.is_playing() {
+                playback_for_timer.position(now)
+            } else if state.capturing {
+                Some(state.capture_position(now))
+            } else {
+                playback_for_timer.cursor()
+            };
+            let timeline_position =
+                playhead.or_else(|| state.connected.then(|| state.capture_position(now)));
+            let bounds = timeline_bounds(&state.notes, timeline_position);
+            status_for_timer.set_text(&format!("{}  |  {} notes", state.status, state.notes.len()));
+            (playhead, bounds, should_auto)
         };
-        let timeline_position =
-            playhead.or_else(|| state.connected.then(|| state.capture_position(now)));
-        let bounds = timeline_bounds(&state.notes, timeline_position);
-        status_for_timer.set_text(&format!("{}  |  {} notes", state.status, state.notes.len()));
-        drop(state);
+
+        if should_auto && !auto_generation.queue(false, true) {
+            auto_busy_for_timer.store(false, Ordering::SeqCst);
+        }
 
         let viewport = timeline_for_timer.width().max(1);
         let content_width = bounds.map_or(viewport, |(start, end)| {
@@ -575,6 +715,7 @@ pub(crate) fn build_ui(app: &Application) {
         } else {
             "Rec"
         });
+        generate_for_timer.set_visible(explicit_mode_for_timer.is_active());
         let playing = playback_for_timer.is_playing();
         let paused = playback_for_timer.is_paused();
         play_for_timer.set_label(if paused { "Resume" } else { "Play" });
@@ -598,6 +739,9 @@ pub(crate) fn build_ui(app: &Application) {
     controls.append(&Label::new(Some("Model")));
     controls.append(&model);
     controls.append(&model_browse);
+    controls.append(&Label::new(Some("Mode")));
+    controls.append(&auto_mode);
+    controls.append(&explicit_mode);
     controls.append(&Label::new(Some("BPM")));
     controls.append(&bpm);
     controls.append(&generate);

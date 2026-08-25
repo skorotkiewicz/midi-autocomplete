@@ -16,6 +16,8 @@ pub(crate) struct Shared {
     pub(crate) capture_generation: u64,
     pub(crate) capture_started_ms: u64,
     pub(crate) capture_position_ms: u64,
+    pub(crate) input_active: bool,
+    pub(crate) last_input_ms: u64,
 }
 
 impl Shared {
@@ -50,6 +52,8 @@ impl Shared {
             self.capturing = true;
         }
         self.capture_generation += 1;
+        self.input_active = false;
+        self.last_input_ms = now_ms;
         self.status = if self.capturing {
             "Recording MIDI prompt...".into()
         } else {
@@ -63,5 +67,7 @@ impl Shared {
         self.capture_position_ms = 0;
         self.capture_started_ms = now_ms;
         self.capture_generation += 1;
+        self.input_active = false;
+        self.last_input_ms = now_ms;
     }
 }

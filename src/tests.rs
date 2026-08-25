@@ -6,7 +6,7 @@ use crate::playback::{
 };
 use crate::state::{Note, Shared};
 use crate::timeline::timeline_bounds;
-use crate::ui::preferred_index;
+use crate::ui::{auto_generation_due, preferred_index};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -25,6 +25,14 @@ fn config_round_trips() {
     save_config(&path, &expected).unwrap();
     assert_eq!(load_config(&path).unwrap(), expected);
     fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn auto_generation_waits_for_a_complete_idle_pause() {
+    assert!(!auto_generation_due(799, 0, false, 1, 0));
+    assert!(!auto_generation_due(800, 0, true, 1, 0));
+    assert!(!auto_generation_due(800, 0, false, 1, 1));
+    assert!(auto_generation_due(800, 0, false, 1, 0));
 }
 
 #[test]
