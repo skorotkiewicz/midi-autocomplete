@@ -4,14 +4,15 @@ use crate::model::{GenerationRequest, ModelProcess, prompt, resolve_model_path};
 use crate::playback::{PlaybackControl, add_generated, replay};
 use crate::state::Shared;
 use crate::timeline::{
-    PIXELS_PER_MS, draw_roll, scroll_for_playhead, timeline_bounds, timeline_content_width,
+    PIXELS_PER_MS, draw_playhead, draw_roll, scroll_for_playhead, timeline_bounds,
+    timeline_content_width,
 };
 use gtk4::glib;
 use gtk4::prelude::*;
 use gtk4::{
     Adjustment, Application, ApplicationWindow, Box as GtkBox, Button, DrawingArea, DropDown,
     Entry, FileChooserAction, FileChooserNative, FileFilter, GestureClick, Label, Orientation,
-    PolicyType, ResponseType, ScrolledWindow, SpinButton, ToggleButton,
+    Overlay, PolicyType, ResponseType, ScrolledWindow, SpinButton, ToggleButton,
 };
 use midir::{MidiInputConnection, MidiOutputConnection};
 use std::cell::RefCell;
@@ -206,6 +207,11 @@ pub(crate) fn build_ui(app: &Application) {
         .vexpand(true)
         .child(&roll)
         .build();
+    let playhead_layer = DrawingArea::builder().hexpand(true).vexpand(true).build();
+    playhead_layer.set_can_target(false);
+    let timeline_overlay = Overlay::new();
+    timeline_overlay.set_child(Some(&timeline));
+    timeline_overlay.add_overlay(&playhead_layer);
 
     let state_for_draw = shared.clone();
     let playback_for_draw = playback_control.clone();
@@ -220,6 +226,21 @@ pub(crate) fn build_ui(app: &Application) {
             playback_for_draw.cursor()
         };
         draw_roll(cr, width, height, &state.notes, playhead);
+    });
+
+    let state_for_playhead = shared.clone();
+    let playback_for_playhead = playback_control.clone();
+    playhead_layer.set_draw_func(move |_, cr, width, height| {
+        let now = started.elapsed().as_millis() as u64;
+        let state = state_for_playhead.lock().unwrap();
+        let playhead = if playback_for_playhead.is_playing() {
+            playback_for_playhead.position(now)
+        } else if state.capturing {
+            Some(state.capture_position(now))
+        } else {
+            playback_for_playhead.cursor()
+        };
+        draw_playhead(cr, width, height, &state.notes, playhead);
     });
 
     let config_for_input = config.clone();
@@ -624,6 +645,7 @@ pub(crate) fn build_ui(app: &Application) {
     });
 
     let roll_for_timer = roll.clone();
+    let playhead_for_timer = playhead_layer.clone();
     let timeline_for_timer = timeline.clone();
     let state_for_timer = shared.clone();
     let status_for_timer = status.clone();
@@ -722,6 +744,7 @@ pub(crate) fn build_ui(app: &Application) {
         pause_for_timer.set_visible(playing);
         stop_for_timer.set_visible(playing || paused);
         roll_for_timer.queue_draw();
+        playhead_for_timer.queue_draw();
         glib::ControlFlow::Continue
     });
 
@@ -762,7 +785,7 @@ pub(crate) fn build_ui(app: &Application) {
     content.append(&devices);
     content.append(&controls);
     content.append(&playback);
-    content.append(&timeline);
+    content.append(&timeline_overlay);
     content.append(&status);
 
     ApplicationWindow::builder()

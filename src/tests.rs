@@ -5,7 +5,9 @@ use crate::playback::{
     PlaybackControl, add_generated, render_soundfont, replay_events_from, send_midi_events,
 };
 use crate::state::{Note, Shared};
-use crate::timeline::{scroll_for_playhead, timeline_bounds, timeline_content_width};
+use crate::timeline::{
+    playhead_overlay_x, scroll_for_playhead, timeline_bounds, timeline_content_width,
+};
 use crate::ui::{auto_generation_due, preferred_index};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -103,6 +105,17 @@ fn playhead_stays_at_twenty_percent_after_the_opening() {
     let content_width = timeline_content_width(0, 12_500, 1_000);
     let maximum_scroll = content_width - 1_000;
     assert_eq!(1_000 - maximum_scroll, 200);
+
+    assert_eq!(playhead_overlay_x(&[], 1_000, 1_000), 0.0);
+    let notes = [Note {
+        pitch: 60,
+        onset_ms: 0,
+        duration_ms: 20_000,
+        velocity: 80,
+        generated: false,
+    }];
+    assert_eq!(playhead_overlay_x(&notes, 1_000, 1_000), 80.0);
+    assert_eq!(playhead_overlay_x(&notes, 10_000, 1_000), 200.0);
 }
 
 #[test]
