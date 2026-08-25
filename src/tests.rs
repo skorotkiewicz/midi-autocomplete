@@ -106,7 +106,7 @@ fn playhead_stays_at_twenty_percent_after_the_opening() {
     let maximum_scroll = content_width - 1_000;
     assert_eq!(1_000 - maximum_scroll, 200);
 
-    assert_eq!(playhead_overlay_x(&[], 1_000, 1_000), 0.0);
+    assert_eq!(playhead_overlay_x(&[], 1_000, 1_000, 0.0, true), 0.0);
     let notes = [Note {
         pitch: 60,
         onset_ms: 0,
@@ -114,8 +114,12 @@ fn playhead_stays_at_twenty_percent_after_the_opening() {
         velocity: 80,
         generated: false,
     }];
-    assert_eq!(playhead_overlay_x(&notes, 1_000, 1_000), 80.0);
-    assert_eq!(playhead_overlay_x(&notes, 10_000, 1_000), 200.0);
+    assert_eq!(playhead_overlay_x(&notes, 1_000, 1_000, 0.0, true), 80.0);
+    assert_eq!(playhead_overlay_x(&notes, 10_000, 1_000, 0.0, true), 200.0);
+    assert_eq!(
+        playhead_overlay_x(&notes, 10_000, 1_000, 400.0, false),
+        400.0
+    );
 }
 
 #[test]

@@ -230,17 +230,27 @@ pub(crate) fn build_ui(app: &Application) {
 
     let state_for_playhead = shared.clone();
     let playback_for_playhead = playback_control.clone();
+    let timeline_for_playhead = timeline.clone();
     playhead_layer.set_draw_func(move |_, cr, width, height| {
         let now = started.elapsed().as_millis() as u64;
         let state = state_for_playhead.lock().unwrap();
-        let playhead = if playback_for_playhead.is_playing() {
+        let playing = playback_for_playhead.is_playing();
+        let playhead = if playing {
             playback_for_playhead.position(now)
         } else if state.capturing {
             Some(state.capture_position(now))
         } else {
             playback_for_playhead.cursor()
         };
-        draw_playhead(cr, width, height, &state.notes, playhead);
+        draw_playhead(
+            cr,
+            width,
+            height,
+            &state.notes,
+            playhead,
+            timeline_for_playhead.hadjustment().value(),
+            playing || state.capturing,
+        );
     });
 
     let config_for_input = config.clone();
@@ -677,7 +687,7 @@ pub(crate) fn build_ui(app: &Application) {
         }
 
         let auto_selected = auto_mode_for_timer.is_active();
-        let (playhead, bounds, should_auto) = {
+        let (playhead, bounds, should_auto, follow_playhead) = {
             let mut state = state_for_timer.lock().unwrap();
             let input_notes = state.notes.iter().filter(|note| !note.generated).count();
             if input_notes < auto_requested_notes {
@@ -711,8 +721,9 @@ pub(crate) fn build_ui(app: &Application) {
             let timeline_position =
                 playhead.or_else(|| state.connected.then(|| state.capture_position(now)));
             let bounds = timeline_bounds(&state.notes, timeline_position);
+            let follow_playhead = playback_for_timer.is_playing() || state.capturing;
             status_for_timer.set_text(&format!("{}  |  {} notes", state.status, state.notes.len()));
-            (playhead, bounds, should_auto)
+            (playhead, bounds, should_auto, follow_playhead)
         };
 
         if should_auto && !auto_generation.queue(false, true) {
@@ -724,7 +735,7 @@ pub(crate) fn build_ui(app: &Application) {
             timeline_content_width(start, end, viewport)
         });
         roll_for_timer.set_content_width(content_width.max(viewport));
-        if let (Some(playhead), Some((start, _))) = (playhead, bounds) {
+        if follow_playhead && let (Some(playhead), Some((start, _))) = (playhead, bounds) {
             let x = playhead.saturating_sub(start) as f64 * PIXELS_PER_MS;
             timeline_for_timer
                 .hadjustment()
