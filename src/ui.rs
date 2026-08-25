@@ -1,7 +1,7 @@
 use crate::config::{AppConfig, config_path, load_config, save_config};
 use crate::midi::{connect_devices, midi_inputs, midi_outputs, silence_output};
 use crate::model::{GenerationRequest, ModelProcess, prompt, resolve_model_path};
-use crate::playback::{PlaybackControl, play_generated, replay};
+use crate::playback::{PlaybackControl, add_generated, replay};
 use crate::state::Shared;
 use crate::timeline::{PIXELS_PER_MS, draw_roll, timeline_bounds};
 use gtk4::glib;
@@ -352,6 +352,10 @@ pub(crate) fn build_ui(app: &Application) {
     let config_for_play = config.clone();
     let path_for_play = config_path.clone();
     play.connect_clicked(move |_| {
+        if playback_for_play.is_rendering() {
+            state_for_play.lock().unwrap().status = "SoundFont is still rendering...".into();
+            return;
+        }
         let path = PathBuf::from(soundfont_for_play.text().as_str());
         if path.as_os_str().is_empty() {
             state_for_play.lock().unwrap().status = "Choose a .sf2 SoundFont first".into();
@@ -390,8 +394,6 @@ pub(crate) fn build_ui(app: &Application) {
 
     let (requests, receiver) = mpsc::channel::<GenerationRequest>();
     let worker_state = shared.clone();
-    let worker_output = output.clone();
-    let worker_playback = playback_control.clone();
     thread::spawn(move || {
         let mut process: Option<ModelProcess> = None;
         while let Ok(request) = receiver.recv() {
@@ -409,14 +411,7 @@ pub(crate) fn build_ui(app: &Application) {
             }
             worker_state.lock().unwrap().status = "Generating...".into();
             match process.as_mut().unwrap().generate(&request.prompt) {
-                Ok(notes) => play_generated(
-                    notes,
-                    request.bpm,
-                    started,
-                    worker_state.clone(),
-                    worker_output.clone(),
-                    worker_playback.clone(),
-                ),
+                Ok(notes) => add_generated(notes, request.bpm, worker_state.clone()),
                 Err(error) => {
                     worker_state.lock().unwrap().status = error;
                     process = None;
@@ -505,6 +500,7 @@ pub(crate) fn build_ui(app: &Application) {
         });
         let playing = playback_for_timer.is_playing();
         play_for_timer.set_visible(!playing);
+        play_for_timer.set_sensitive(!playback_for_timer.is_rendering());
         stop_for_timer.set_visible(playing);
         roll_for_timer.queue_draw();
         glib::ControlFlow::Continue

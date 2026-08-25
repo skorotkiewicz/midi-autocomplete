@@ -1,7 +1,9 @@
 use crate::config::{AppConfig, config_path, load_config, save_config};
 use crate::midi::{connect_output, midi_inputs, midi_outputs};
 use crate::model::{prompt, repo_root, resolve_model_path};
-use crate::playback::{PlaybackControl, render_soundfont, replay_events, send_midi_events};
+use crate::playback::{
+    PlaybackControl, add_generated, render_soundfont, replay_events, send_midi_events,
+};
 use crate::state::{Note, Shared};
 use crate::timeline::timeline_bounds;
 use crate::ui::preferred_index;
@@ -46,12 +48,25 @@ fn model_path_passes_urls_through_and_resolves_locals_from_repo_root() {
 #[test]
 fn playhead_maps_wall_time_to_musical_time() {
     let playback = PlaybackControl::default();
-    let generation = playback.begin();
+    let generation = playback.begin_rendering();
+    assert!(playback.start_playback(generation));
     playback.set_timeline(generation, 1_000, 500, 900);
     assert_eq!(playback.position(1_200), Some(700));
     assert_eq!(playback.position(2_000), Some(900));
     playback.finish(generation);
     assert_eq!(playback.position(2_000), None);
+}
+
+#[test]
+fn soundfont_rendering_is_not_playback() {
+    let playback = PlaybackControl::default();
+    let generation = playback.begin_rendering();
+    assert!(playback.is_rendering());
+    assert!(!playback.is_playing());
+
+    assert!(playback.start_playback(generation));
+    assert!(!playback.is_rendering());
+    assert!(playback.is_playing());
 }
 
 #[test]
@@ -76,6 +91,20 @@ fn recording_resumes_from_its_frozen_position() {
     assert!(state.toggle_capture(5_000));
     assert_eq!(state.capture_position(5_100), 250);
     assert_eq!(state.capture_generation, 3);
+}
+
+#[test]
+fn generated_notes_wait_for_soundfont_playback() {
+    let shared = Arc::new(Mutex::new(Shared::default()));
+    add_generated(vec![(64, 0, 12, 90)], 120.0, shared.clone());
+
+    let state = shared.lock().unwrap();
+    assert_eq!(state.notes.len(), 1);
+    assert!(state.notes[0].generated);
+    assert_eq!(
+        state.status,
+        "Generated 1 notes. Click Play to render them."
+    );
 }
 
 #[test]
@@ -110,7 +139,8 @@ fn replay_normalizes_the_musical_timeline() {
 #[test]
 fn stop_cancels_scheduled_midi_without_waiting() {
     let playback = Arc::new(PlaybackControl::default());
-    let generation = playback.begin();
+    let generation = playback.begin_rendering();
+    assert!(playback.start_playback(generation));
     assert!(playback.is_playing());
     playback.stop();
     assert!(!playback.is_playing());
