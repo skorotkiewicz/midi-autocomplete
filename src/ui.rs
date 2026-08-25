@@ -12,12 +12,12 @@ use gtk4::glib;
 use gtk4::prelude::*;
 use gtk4::{
     Adjustment, Application, ApplicationWindow, Box as GtkBox, Button, DrawingArea, DropDown,
-    Entry, EventControllerScroll, EventControllerScrollFlags, FileChooserAction, FileChooserNative,
-    FileFilter, GestureClick, HeaderBar, Label, MenuButton, Orientation, Overlay, PolicyType,
-    Popover, ResponseType, ScrolledWindow, SpinButton, ToggleButton,
+    Entry, FileChooserAction, FileChooserNative, FileFilter, GestureClick, HeaderBar, Label,
+    MenuButton, Orientation, Overlay, PolicyType, Popover, ResponseType, ScrolledWindow,
+    SpinButton, ToggleButton,
 };
 use midir::{MidiInputConnection, MidiOutputConnection};
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -227,20 +227,6 @@ pub(crate) fn build_ui(app: &Application) {
         .vexpand(true)
         .child(&roll)
         .build();
-    let auto_follow = Rc::new(Cell::new(true));
-    let follow_for_scrollbar = auto_follow.clone();
-    let scrollbar_click = GestureClick::new();
-    scrollbar_click.connect_pressed(move |_, _, _, _| follow_for_scrollbar.set(false));
-    timeline.hscrollbar().add_controller(scrollbar_click);
-    let follow_for_scroll = auto_follow.clone();
-    let scroll = EventControllerScroll::new(EventControllerScrollFlags::BOTH_AXES);
-    scroll.connect_scroll(move |_, dx, _| {
-        if dx != 0.0 {
-            follow_for_scroll.set(false);
-        }
-        glib::Propagation::Proceed
-    });
-    timeline.add_controller(scroll);
     let playhead_layer = DrawingArea::builder().hexpand(true).vexpand(true).build();
     playhead_layer.set_can_target(false);
     let timeline_overlay = Overlay::new();
@@ -396,9 +382,7 @@ pub(crate) fn build_ui(app: &Application) {
 
     let state_for_record = shared.clone();
     let playback_for_record = playback_control.clone();
-    let follow_for_record = auto_follow.clone();
     record.connect_clicked(move |_| {
-        follow_for_record.set(true);
         let selected_position = {
             let mut state = state_for_record.lock().unwrap();
             if !state.connected {
@@ -590,9 +574,7 @@ pub(crate) fn build_ui(app: &Application) {
     let soundfont_for_play = soundfont.clone();
     let config_for_play = config.clone();
     let path_for_play = config_path.clone();
-    let follow_for_play = auto_follow.clone();
     play.connect_clicked(move |_| {
-        follow_for_play.set(true);
         if generation_busy_for_play.load(Ordering::SeqCst) {
             state_for_play.lock().unwrap().status = "Wait for generation to finish".into();
             return;
@@ -660,11 +642,9 @@ pub(crate) fn build_ui(app: &Application) {
     let soundfont_for_seek = soundfont.clone();
     let timeline_for_seek = timeline.clone();
     let auto_resume_for_seek = auto_resume.clone();
-    let follow_for_seek = auto_follow.clone();
     seek.connect_pressed(move |_, _, x, _| {
         let now = started.elapsed().as_millis() as u64;
         auto_resume_for_seek.store(false, Ordering::SeqCst);
-        follow_for_seek.set(true);
         let (notes, bounds) = {
             let mut state = state_for_seek.lock().unwrap();
             let playhead = playback_for_seek
@@ -835,9 +815,7 @@ pub(crate) fn build_ui(app: &Application) {
     let auto_generation = generation_controls.clone();
     let generation_busy_for_timer = generation_busy.clone();
     let auto_resume_for_timer = auto_resume.clone();
-    let auto_follow_for_timer = auto_follow.clone();
     let mut auto_requested_notes = 0;
-    let mut transport_was_active = false;
     glib::timeout_add_local(Duration::from_millis(33), move || {
         let now = started.elapsed().as_millis() as u64;
         if auto_resume_for_timer.load(Ordering::SeqCst)
@@ -888,15 +866,7 @@ pub(crate) fn build_ui(app: &Application) {
             let timeline_position =
                 playhead.or_else(|| state.connected.then(|| state.capture_position(now)));
             let bounds = timeline_bounds(&state.notes, timeline_position);
-            let transport_active = playback_for_timer.is_rendering()
-                || playback_for_timer.is_playing()
-                || state.capturing;
-            if transport_active && !transport_was_active {
-                auto_follow_for_timer.set(true);
-            }
-            transport_was_active = transport_active;
-            let follow_playhead =
-                auto_follow_for_timer.get() && (playback_for_timer.is_playing() || state.capturing);
+            let follow_playhead = playback_for_timer.is_playing() || state.capturing;
             status_for_timer.set_text(&format!("{}  |  {} notes", state.status, state.notes.len()));
             (playhead, bounds, should_auto, follow_playhead)
         };
